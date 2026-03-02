@@ -35,7 +35,7 @@ A powerful C drive cleanup tool for Windows that can scan and clean junk files, 
 
 This project is built with **Python + Fluent 2 Design**, completely open source and free, designed for the Windows platform. It supports various cleanup modes including regular junk cleanup, large file scanning, duplicate file finding, empty folder cleanup, invalid shortcut cleanup, and registry cleanup. It also provides a GUI interface, automatically requests administrator privileges on startup, recycle bin/permanent deletion options, and more. Easy to operate, suitable for all types of users.
 
-<img width="1682" height="969" alt="QQ_1772186747866" src="https://github.com/user-attachments/assets/866ccfb3-9295-4c97-9ec6-0c9a4248726c" />
+<img width="1682" height="969" alt="QQ_1772472271177" src="https://github.com/user-attachments/assets/13dbfd3c-58cb-45c7-b11e-4f57edc51743" />
 
 ---
 
