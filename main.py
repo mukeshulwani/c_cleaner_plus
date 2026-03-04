@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-C盘强力清理工具 v0.2.8
+C盘强力清理工具 v0.2.9-alpha01
 PySide6 + PySide6-Fluent-Widgets (Fluent2 UI)
 包含：常规清理(支持拖拽排序与自定义规则)、大文件扫描、重复文件、空文件夹、无效快捷方式
 """
@@ -17,7 +17,7 @@ from PySide6.QtWidgets import (
     QApplication, QWidget, QVBoxLayout, QHBoxLayout,
     QAbstractItemView, QTableWidgetItem, QStyledItemDelegate,
     QTreeWidget, QTreeWidgetItem, QHeaderView,
-    QFileIconProvider, QFileDialog, QDialog
+    QFileIconProvider, QFileDialog
 )
 
 from qfluentwidgets import (
@@ -35,7 +35,7 @@ from qfluentwidgets import (
 # ══════════════════════════════════════════════════════════
 #  版本与更新配置
 # ══════════════════════════════════════════════════════════
-CURRENT_VERSION = "0.2.8"
+CURRENT_VERSION = "0.2.9-alpha01"
 UPDATE_JSON_URL = "https://gitee.com/kio0/c_cleaner_plus/raw/master/update.json"
 
 from qfluentwidgets.components.widgets.table_view import TableItemDelegate
@@ -487,7 +487,7 @@ def default_clean_targets():
         ("WER(系统)", J(sr, "System32", "config", "systemprofile", "AppData", "Local", "Microsoft", "Windows", "WER"), "dir", False, "需管理员", False),
         ("Minidump", J(sr, "Minidump"), "dir", True, "崩溃转储", False),
         ("MEMORY.DMP", J(sr, "MEMORY.DMP"), "file", False, "确认不调试时勾选", False),
-        ("缩略图缓存", J(la, "Microsoft", "Windows", "Explorer"), "glob", True, "thumbcache*.db", False),
+        ("缩略图缓存", J(la, "Microsoft", "Windows", "Explorer"), "glob", True, "资源管理器缩略图数据库缓存", False, "thumbcache*.db"),
         
         ("D3DSCache", J(la, "D3DSCache"), "dir", False, "d3d着色器缓存", False),
         ("NVIDIA DX", J(la, "NVIDIA", "DXCache"), "dir", False, "NV着色器缓存", False),
@@ -653,14 +653,110 @@ def make_title_row(icon: FIF, text: str):
     lbl = TitleLabel(text); setFont(lbl, 22, QFont.Weight.Bold); row.addWidget(lbl)
     row.addStretch(); return row
 
-def make_rule_key(nm, pa, tp):
-    return (nm, pa, tp)
+RULE_GLOB_DEFAULT_PATTERN = "thumbcache*.db"
+HIGH_RISK_GLOB_EXTENSIONS = {
+    ".exe", ".dll", ".sys", ".msi", ".bat", ".cmd", ".ps1",
+    ".reg", ".com", ".scr", ".drv", ".ocx"
+}
+
+def normalize_rule_pattern(tp, pattern="", note=""):
+    if tp != "glob":
+        return ""
+
+    raw = str(pattern or "").strip()
+    if raw:
+        return raw
+
+    note_text = str(note or "").strip()
+    if any(ch in note_text for ch in ("*", "?", "[")):
+        return note_text
+
+    return RULE_GLOB_DEFAULT_PATTERN
+
+def parse_rule_entry(entry, force_custom=None):
+    if not isinstance(entry, (list, tuple)) or len(entry) < 5:
+        return None
+
+    nm, pa, tp, en, nt = entry[0], entry[1], entry[2], entry[3], entry[4]
+    if force_custom is None:
+        is_custom = bool(entry[5]) if len(entry) >= 6 else False
+    else:
+        is_custom = bool(force_custom)
+
+    pattern = normalize_rule_pattern(tp, entry[6] if len(entry) >= 7 else "", nt)
+    return (nm, pa, tp, bool(en), nt, is_custom, pattern)
+
+def serialize_rule_entry(entry):
+    parsed = parse_rule_entry(entry)
+    if not parsed:
+        return None
+    nm, pa, tp, en, nt, is_custom, pattern = parsed
+    if tp == "glob":
+        return [nm, pa, tp, en, nt, is_custom, pattern]
+    return [nm, pa, tp, en, nt, is_custom]
+
+def make_rule_key(nm, pa, tp, pattern=""):
+    return (nm, pa, tp, normalize_rule_pattern(tp, pattern, ""))
+
+def rule_display_target(pa, tp, pattern=""):
+    if tp == "glob":
+        return f"{pa} | {normalize_rule_pattern(tp, pattern, '')}"
+    return pa
+
+def get_rule_runtime_risk(entry):
+    parsed = parse_rule_entry(entry)
+    if not parsed:
+        return ""
+
+    nm, pa, tp, _, _, _, pattern = parsed
+    raw_path = norm_path(pa)
+    if not raw_path:
+        return ""
+
+    dump_rule_names = {"livekernelreports", "minidump", "memory.dmp"}
+    if str(nm or "").strip().lower() in dump_rule_names:
+        return f"{nm}：诊断转储文件，删除后会影响蓝屏或内核故障排查"
+
+    drive, tail = os.path.splitdrive(raw_path)
+    if drive and tail in ("\\", ""):
+        return f"{nm}：目标指向磁盘根目录 {display_path(raw_path)}"
+
+    system_root = os.environ.get("SystemRoot", r"C:\Windows")
+    program_files = os.environ.get("ProgramFiles", r"C:\Program Files")
+    program_files_x86 = os.environ.get("ProgramFiles(x86)", r"C:\Program Files (x86)")
+    user_root = os.path.join(os.path.splitdrive(raw_path)[0] + "\\", "Users") if drive else r"C:\Users"
+
+    dangerous_roots = [
+        system_root,
+        program_files,
+        program_files_x86,
+        os.environ.get("USERPROFILE", ""),
+        user_root
+    ]
+
+    norm_raw = os.path.normcase(os.path.abspath(raw_path))
+    for candidate in dangerous_roots:
+        if not candidate:
+            continue
+        norm_candidate = os.path.normcase(os.path.abspath(candidate))
+        if norm_raw == norm_candidate:
+            return f"{nm}：目标指向高风险目录 {display_path(raw_path)}"
+
+    if tp == "glob":
+        rule_pattern = normalize_rule_pattern(tp, pattern, "")
+        lower_pattern = rule_pattern.lower()
+        if any(ext in lower_pattern for ext in HIGH_RISK_GLOB_EXTENSIONS):
+            return f"{nm}：匹配模式可能命中可执行或系统文件 ({rule_pattern})"
+
+    return ""
 
 def load_rule_keys(raw_items):
     keys = set()
     for item in raw_items or []:
         if isinstance(item, (list, tuple)) and len(item) >= 3:
-            keys.add((item[0], item[1], item[2]))
+            nm, pa, tp = item[0], item[1], item[2]
+            pattern = item[3] if len(item) >= 4 else ""
+            keys.add(make_rule_key(nm, pa, tp, pattern))
     return keys
 
 def app_root_dir():
@@ -886,13 +982,6 @@ def resolve_rule_pack(title_text, filename, parent=None, base_dir=None):
             InfoBar.warning("下载失败", f"{title_text} 下载失败，已回退使用本地缓存", parent=parent)
         return path, str(e)
 
-def localize_file_dialog(dialog: QFileDialog):
-    dialog.setLabelText(QFileDialog.DialogLabel.LookIn, "查找范围:")
-    dialog.setLabelText(QFileDialog.DialogLabel.FileName, "文件名:")
-    dialog.setLabelText(QFileDialog.DialogLabel.FileType, "文件类型:")
-    dialog.setLabelText(QFileDialog.DialogLabel.Accept, "导入")
-    dialog.setLabelText(QFileDialog.DialogLabel.Reject, "取消")
-
 class AddRuleDialog(MessageBoxBase):
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -907,14 +996,25 @@ class AddRuleDialog(MessageBoxBase):
         self.pathLayout.addWidget(self.pathInput, 1); self.pathLayout.addWidget(self.btnBrowse)
         
         self.typeCombo = ComboBox(); self.typeCombo.addItems(["目录内所有文件 (dir)", "指定单个文件 (file)", "指定类型文件 (glob)"])
+        self.typeCombo.currentIndexChanged.connect(self._on_type_changed)
+        self.patternLayout = QHBoxLayout()
+        self.patternInput = LineEdit()
+        self.patternInput.setPlaceholderText("匹配模式 (例如: *.log)")
+        self.btnPatternHelp = ToolButton(FIF.INFO)
+        self.btnPatternHelp.setToolTip("匹配模式说明")
+        self.btnPatternHelp.clicked.connect(self._show_pattern_help)
+        self.patternLayout.addWidget(self.patternInput, 1)
+        self.patternLayout.addWidget(self.btnPatternHelp)
         self.descInput = LineEdit(); self.descInput.setPlaceholderText("说明备注 (例如: 仅限个人使用)")
         
         self.viewLayout.addWidget(StrongBodyLabel("规则名称:")); self.viewLayout.addWidget(self.nameInput)
         self.viewLayout.addWidget(StrongBodyLabel("目标路径:")); self.viewLayout.addLayout(self.pathLayout)
         self.viewLayout.addWidget(StrongBodyLabel("目标类型:")); self.viewLayout.addWidget(self.typeCombo)
+        self.viewLayout.addWidget(StrongBodyLabel("匹配模式:")); self.viewLayout.addLayout(self.patternLayout)
         self.viewLayout.addWidget(StrongBodyLabel("备注说明:")); self.viewLayout.addWidget(self.descInput)
         
         self.widget.setMinimumWidth(450); self.yesButton.setText("添加"); self.cancelButton.setText("取消")
+        self._on_type_changed(self.typeCombo.currentIndex())
         
     def _browse(self):
         idx = self.typeCombo.currentIndex()
@@ -924,10 +1024,45 @@ class AddRuleDialog(MessageBoxBase):
         else:
             file, _ = QFileDialog.getOpenFileName(self, "选择清理文件")
             if file: self.pathInput.setText(file.replace("/", "\\"))
+
+    def _on_type_changed(self, idx):
+        is_glob = idx == 2
+        self.patternInput.setEnabled(is_glob)
+        self.btnPatternHelp.setEnabled(is_glob)
+        if is_glob and not self.patternInput.text().strip():
+            self.patternInput.setText(RULE_GLOB_DEFAULT_PATTERN)
+        elif not is_glob:
+            self.patternInput.clear()
+
+    def _show_pattern_help(self):
+        MessageBox(
+            "匹配模式说明",
+            "匹配模式用于指定目录下哪些文件会被命中。\n\n"
+            "常见写法：\n"
+            "*.log  匹配所有 .log 文件\n"
+            "*.tmp  匹配所有 .tmp 文件\n"
+            "cache_*  匹配以 cache_ 开头的文件\n"
+            "thumbcache*.db  匹配缩略图缓存数据库\n\n"
+            "说明：\n"
+            "* 代表任意长度字符\n"
+            "? 代表任意单个字符\n"
+            "[abc] 代表括号中的任意一个字符",
+            self
+        ).exec()
             
     def get_data(self):
         t_map = {0: "dir", 1: "file", 2: "glob"}
-        return (self.nameInput.text().strip(), self.pathInput.text().strip(), t_map[self.typeCombo.currentIndex()], True, self.descInput.text().strip() or "自定义附加规则", True)
+        tp = t_map[self.typeCombo.currentIndex()]
+        pattern = normalize_rule_pattern(tp, self.patternInput.text().strip(), "")
+        return (
+            self.nameInput.text().strip(),
+            self.pathInput.text().strip(),
+            tp,
+            True,
+            self.descInput.text().strip() or "自定义附加规则",
+            True,
+            pattern
+        )
 
 class LegacyMigrationDialog(MessageBoxBase):
     def __init__(self, old_dir, new_dir, parent=None):
@@ -958,87 +1093,6 @@ class LegacyMigrationDialog(MessageBoxBase):
 
     def selected_mode(self):
         return self.mode_combo.currentIndex()
-
-class ImportRulesDialog(QDialog):
-    def __init__(self, parent=None):
-        super().__init__(parent)
-        self.selected_path = ""
-        self.selected_source_name = ""
-
-        self.setWindowTitle("导入规则集")
-        self.setModal(True)
-        self.resize(860, 560)
-        self.setMinimumSize(760, 500)
-        if parent is not None:
-            self.setWindowIcon(parent.windowIcon())
-
-        root = QVBoxLayout(self)
-        root.setContentsMargins(20, 20, 20, 20)
-        root.setSpacing(12)
-
-        title = TitleLabel("导入规则集")
-        setFont(title, 18, QFont.Weight.Bold)
-        root.addWidget(title)
-
-        desc = CaptionLabel("左侧可直接导入内置示例规则，右侧可浏览任意目录中的 JSON 规则文件")
-        desc.setTextColor(QColor(128, 128, 128))
-        root.addWidget(desc)
-
-        content = QHBoxLayout()
-        content.setSpacing(12)
-        root.addLayout(content, 1)
-
-        left = CardWidget(self)
-        left.setFixedWidth(220)
-        left_layout = QVBoxLayout(left)
-        left_layout.setContentsMargins(14, 14, 14, 14)
-        left_layout.setSpacing(8)
-        left_layout.addWidget(StrongBodyLabel("通用规则"))
-        left_tip = CaptionLabel("点击左侧按钮会自动下载对应规则包到本地并直接导入")
-        left_tip.setWordWrap(True)
-        left_tip.setTextColor(QColor(128, 128, 128))
-        left_layout.addWidget(left_tip)
-        for title_text, filename in SAMPLE_RULE_PACKS:
-            btn = PushButton(FIF.DOCUMENT, title_text)
-            btn.clicked.connect(lambda checked=False, t=title_text, fn=filename: self._choose_sample_rule(t, fn))
-            left_layout.addWidget(btn)
-        left_layout.addStretch()
-        content.addWidget(left)
-
-        right = CardWidget(self)
-        right_layout = QVBoxLayout(right)
-        right_layout.setContentsMargins(8, 8, 8, 8)
-        right_layout.setSpacing(8)
-        self.file_dialog = QFileDialog(self, "选择规则文件")
-        self.file_dialog.setOption(QFileDialog.Option.DontUseNativeDialog, True)
-        self.file_dialog.setFileMode(QFileDialog.FileMode.ExistingFile)
-        self.file_dialog.setNameFilter("JSON 文件 (*.json)")
-        self.file_dialog.setDirectory(app_root_dir())
-        localize_file_dialog(self.file_dialog)
-        self.file_dialog.accepted.connect(self._choose_file_rule)
-        right_layout.addWidget(self.file_dialog)
-        content.addWidget(right, 1)
-
-    def _choose_sample_rule(self, title_text, filename):
-        base_dir = getattr(self.parent(), "config_dir", None)
-        try:
-            path, _ = resolve_rule_pack(title_text, filename, parent=self, base_dir=base_dir)
-        except Exception as e:
-            InfoBar.error("导入失败", str(e), parent=self)
-            return
-        self.selected_path = path
-        self.selected_source_name = title_text
-        self.accept()
-
-    def _choose_file_rule(self):
-        files = self.file_dialog.selectedFiles()
-        path = files[0] if files else ""
-        if not path:
-            InfoBar.warning("提示", "请先选择一个 JSON 规则文件", parent=self)
-            return
-        self.selected_path = path
-        self.selected_source_name = "外部规则集"
-        self.accept()
 
 class RulePackManagerDialog(MessageBoxBase):
     def __init__(self, main_win, store_items, parent=None):
@@ -1596,7 +1650,10 @@ class SettingPage(ScrollArea):
             try:
                 # 重置 targets 列表
                 self.main_win.targets.clear()
-                self.main_win.targets.extend(default_clean_targets())
+                defaults = [parse_rule_entry(t) for t in default_clean_targets()]
+                defaults = [t for t in defaults if t]
+                self.main_win.targets.extend(defaults)
+                self.main_win.builtin_rule_keys = {make_rule_key(t[0], t[1], t[2], t[6]) for t in defaults}
                 
                 # 重绘常规清理表格
                 self.main_win.pg_clean.reload_table()
@@ -1626,6 +1683,15 @@ class CleanPage(ScrollArea):
         v.addLayout(make_title_row(FIF.BROOM, "常规清理"))
         badge = "管理员" if is_admin() else "非管理员"
         v.addWidget(CaptionLabel(f"当前权限：{badge}  |  长按或框选项目可拖动排序"))
+
+        search_row = QHBoxLayout()
+        self.search_input = SearchLineEdit()
+        self.search_input.setPlaceholderText("搜索规则名称、路径或说明...")
+        self.search_input.setFixedWidth(320)
+        self.search_input.textChanged.connect(self._filter_rules)
+        search_row.addWidget(self.search_input)
+        search_row.addStretch()
+        v.addLayout(search_row)
 
         opt=QHBoxLayout(); opt.setSpacing(8)
         self.chk_perm=CheckBox("强力模式：永久删除"); self.chk_perm.setChecked(True); opt.addWidget(self.chk_perm)
@@ -1664,27 +1730,39 @@ class CleanPage(ScrollArea):
     def reload_table(self):
         self.tbl.setRowCount(0)
         self.tbl.setRowCount(len(self.targets))
-        for i,(nm,pa,tp,en,nt,is_c) in enumerate(self.targets):
+        for i, entry in enumerate(self.targets):
+            nm, pa, tp, en, nt, is_c, pattern = parse_rule_entry(entry)
             disp_name = f"{nm} (自定义)" if is_c else nm
             chk_item = make_check_item(en)
             name_item = QTableWidgetItem(disp_name)
-            name_item.setData(Qt.ItemDataRole.UserRole, (nm, pa, tp, is_c))
+            name_item.setData(Qt.ItemDataRole.UserRole, (nm, pa, tp, is_c, pattern))
             
             self.tbl.setItem(i, 0, chk_item)
             self.tbl.setItem(i, 1, name_item)
-            self.tbl.setItem(i, 2, QTableWidgetItem(pa if tp!="glob" else f"{pa} | thumbcache*.db"))
+            self.tbl.setItem(i, 2, QTableWidgetItem(rule_display_target(pa, tp, pattern)))
             self.tbl.setItem(i, 3, QTableWidgetItem(nt))
             self.tbl.setItem(i, 4, QTableWidgetItem(""))
+        self._filter_rules(self.search_input.text())
+
+    def _filter_rules(self, text):
+        query = str(text or "").strip().lower()
+        for row in range(self.tbl.rowCount()):
+            cells = []
+            for col in (1, 2, 3):
+                item = self.tbl.item(row, col)
+                cells.append(item.text().lower() if item and item.text() else "")
+            matched = (not query) or any(query in cell for cell in cells)
+            self.tbl.setRowHidden(row, not matched)
 
     def toggle_sel_all(self):
-        rc = self.tbl.rowCount()
-        if rc == 0: return
+        rows = [r for r in range(self.tbl.rowCount()) if not self.tbl.isRowHidden(r)]
+        if not rows: return
         all_checked = True
-        for r in range(rc):
+        for r in rows:
             if not is_row_checked(self.tbl, r):
                 all_checked = False; break
         new_state = not all_checked
-        for r in range(rc): set_row_checked(self.tbl, r, new_state)
+        for r in rows: set_row_checked(self.tbl, r, new_state)
             
         if new_state:
             self.btn_sel_all.setText("取消全选"); self.btn_sel_all.setIcon(FIF.CLOSE)
@@ -1700,12 +1778,12 @@ class CleanPage(ScrollArea):
             
             user_data = name_item.data(Qt.ItemDataRole.UserRole)
             if user_data:
-                nm, pa, tp, is_c = user_data
+                nm, pa, tp, is_c, pattern = user_data
             else: continue
                 
             en = is_row_checked(self.tbl, r)
             nt = self.tbl.item(r, 3).text() if self.tbl.item(r, 3) else ""
-            new_targets.append((nm, pa, tp, en, nt, is_c))
+            new_targets.append((nm, pa, tp, en, nt, is_c, normalize_rule_pattern(tp, pattern, nt)))
         
         if new_targets:
             self.targets[:] = new_targets
@@ -1732,25 +1810,31 @@ class CleanPage(ScrollArea):
         path = self.window().custom_rules_path
         try:
             os.makedirs(os.path.dirname(path), exist_ok=True)
-            with open(path, 'w', encoding='utf-8') as f: json.dump(customs, f, ensure_ascii=False, indent=2)
+            payload = [serialize_rule_entry(t) for t in customs]
+            payload = [t for t in payload if t is not None]
+            with open(path, 'w', encoding='utf-8') as f: json.dump(payload, f, ensure_ascii=False, indent=2)
         except: pass
 
     def do_add_rule(self):
         w = AddRuleDialog(self.window())
         if w.exec():
-            nm, pa, tp, en, nt, is_c = w.get_data()
+            nm, pa, tp, en, nt, is_c, pattern = w.get_data()
             if not nm or not pa:
                 InfoBar.error("错误", "名称和路径不能为空", parent=self.window()); return
-            self.targets.append((nm, pa, tp, en, nt, is_c))
+            if tp == "glob" and not pattern:
+                InfoBar.error("错误", "glob 规则必须填写匹配模式", parent=self.window()); return
+            new_rule = (nm, pa, tp, en, nt, is_c, pattern)
+            self.targets.append(new_rule)
             r = self.tbl.rowCount(); self.tbl.setRowCount(r + 1)
             name_item = QTableWidgetItem(nm + " (自定义)")
-            name_item.setData(Qt.ItemDataRole.UserRole, (nm, pa, tp, is_c))
+            name_item.setData(Qt.ItemDataRole.UserRole, (nm, pa, tp, is_c, pattern))
             
             self.tbl.setItem(r, 0, make_check_item(en))
             self.tbl.setItem(r, 1, name_item)
-            self.tbl.setItem(r, 2, QTableWidgetItem(pa))
+            self.tbl.setItem(r, 2, QTableWidgetItem(rule_display_target(pa, tp, pattern)))
             self.tbl.setItem(r, 3, QTableWidgetItem(nt))
             self.tbl.setItem(r, 4, QTableWidgetItem(""))
+            self._filter_rules(self.search_input.text())
             self.save_custom_rules()
             InfoBar.success("成功", f"规则 '{nm}' 已添加！", parent=self.window())
 
@@ -1767,7 +1851,7 @@ class CleanPage(ScrollArea):
             if cur >= 0:
                 sel_rows = [cur]
 
-        checked_rows = [r for r in range(self.tbl.rowCount()) if is_row_checked(self.tbl, r)]
+        checked_rows = [r for r in range(self.tbl.rowCount()) if not self.tbl.isRowHidden(r) and is_row_checked(self.tbl, r)]
         candidate_rows = sel_rows if sel_rows else checked_rows
         candidate_rows = sorted(set(candidate_rows))
 
@@ -1789,14 +1873,14 @@ class CleanPage(ScrollArea):
             user_data = item.data(Qt.ItemDataRole.UserRole)
             if not user_data:
                 continue
-            nm, pa, tp, is_c = user_data
-            rule_key = make_rule_key(nm, pa, tp)
+            nm, pa, tp, is_c, pattern = user_data
+            rule_key = make_rule_key(nm, pa, tp, pattern)
             if protect_builtin and rule_key in builtin_keys:
                 protected_count += 1
                 continue
             if rule_key in builtin_keys:
                 deleted_builtin_now.append(rule_key)
-            deletable_keys.append((nm, pa, tp, is_c))
+            deletable_keys.append((nm, pa, tp, is_c, pattern))
 
         # 去重，避免重复删除同一规则
         deletable_keys = list(dict.fromkeys(deletable_keys))
@@ -1815,8 +1899,8 @@ class CleanPage(ScrollArea):
 
         # 先删数据源，避免行号变化导致错删
         for i in range(len(self.targets) - 1, -1, -1):
-            nm, pa, tp, _, _, is_c = self.targets[i]
-            if (nm, pa, tp, is_c) in del_key_set:
+            nm, pa, tp, _, _, is_c, pattern = parse_rule_entry(self.targets[i])
+            if (nm, pa, tp, is_c, pattern) in del_key_set:
                 self.targets.pop(i)
 
         # 再删表格行（倒序）
@@ -1851,7 +1935,9 @@ class CleanPage(ScrollArea):
         if not customs: InfoBar.warning("提示", "当前没有自定义规则可以导出", parent=self.window()); return
         path, _ = QFileDialog.getSaveFileName(self, "导出规则集", "CleanRules.json", "JSON 文件 (*.json)")
         if path:
-            with open(path, 'w', encoding='utf-8') as f: json.dump(customs, f, ensure_ascii=False, indent=2)
+            payload = [serialize_rule_entry(t) for t in customs]
+            payload = [t for t in payload if t is not None]
+            with open(path, 'w', encoding='utf-8') as f: json.dump(payload, f, ensure_ascii=False, indent=2)
             InfoBar.success("导出成功", f"规则已保存至: {path}", parent=self.window())
 
     def import_rules_from_path(self, path, source_name="规则集"):
@@ -1863,21 +1949,28 @@ class CleanPage(ScrollArea):
                 rules = json.load(f)
             added = 0
             skipped = 0
+            existing_keys = {make_rule_key(t[0], t[1], t[2], t[6] if len(t) >= 7 else "") for t in self.targets}
             for r_data in rules:
-                if len(r_data) >= 5:
-                    nm, pa, tp, en, nt = r_data[0], r_data[1], r_data[2], r_data[3], r_data[4]
-                    if any(t[0] == nm and t[1] == pa for t in self.targets):
-                        skipped += 1
-                        continue
-                    self.targets.append((nm, pa, tp, en, nt, True))
-                    r = self.tbl.rowCount(); self.tbl.setRowCount(r + 1)
-                    name_item = QTableWidgetItem(nm + " (自定义)")
-                    name_item.setData(Qt.ItemDataRole.UserRole, (nm, pa, tp, True))
-                    
-                    self.tbl.setItem(r, 0, make_check_item(en)); self.tbl.setItem(r, 1, name_item)
-                    self.tbl.setItem(r, 2, QTableWidgetItem(pa)); self.tbl.setItem(r, 3, QTableWidgetItem(nt)); self.tbl.setItem(r, 4, QTableWidgetItem(""))
-                    added += 1
+                parsed = parse_rule_entry(r_data, force_custom=True)
+                if not parsed:
+                    continue
+                nm, pa, tp, en, nt, is_custom, pattern = parsed
+                rule_key = make_rule_key(nm, pa, tp, pattern)
+                if rule_key in existing_keys:
+                    skipped += 1
+                    continue
+                nm, pa, tp, en, nt, is_custom, pattern = parsed
+                existing_keys.add(rule_key)
+                self.targets.append(parsed)
+                r = self.tbl.rowCount(); self.tbl.setRowCount(r + 1)
+                name_item = QTableWidgetItem(nm + " (自定义)")
+                name_item.setData(Qt.ItemDataRole.UserRole, (nm, pa, tp, is_custom, pattern))
+                
+                self.tbl.setItem(r, 0, make_check_item(en)); self.tbl.setItem(r, 1, name_item)
+                self.tbl.setItem(r, 2, QTableWidgetItem(rule_display_target(pa, tp, pattern))); self.tbl.setItem(r, 3, QTableWidgetItem(nt)); self.tbl.setItem(r, 4, QTableWidgetItem(""))
+                added += 1
             if added > 0:
+                self._filter_rules(self.search_input.text())
                 self.save_custom_rules()
                 msg = f"{source_name} 已导入 {added} 条规则"
                 if skipped > 0:
@@ -1917,13 +2010,15 @@ class CleanPage(ScrollArea):
             if self.stop.is_set():
                 self.sig.done.emit(f"估算已取消，耗时 {time.time()-t0:.1f} 秒")
                 return
-            nm,pa,tp,_,_,_ = t
+            nm, pa, tp, _, nt, _, pattern = parse_rule_entry(t)
             e=0
             try:
                 if tp=="dir": e=dir_size(expand_env(pa)) if os.path.isdir(expand_env(pa)) else 0
                 elif tp=="glob": 
                     fo=expand_env(pa)
-                    if os.path.isdir(fo): e=sum(safe_getsize(os.path.join(fo,f)) for f in os.listdir(fo) if fnmatch.fnmatch(f.lower(),"thumbcache*.db"))
+                    if os.path.isdir(fo):
+                        rule_pattern = normalize_rule_pattern(tp, pattern, nt)
+                        e=sum(safe_getsize(os.path.join(fo,f)) for f in os.listdir(fo) if fnmatch.fnmatch(f.lower(), rule_pattern.lower()))
                 elif tp=="file": e=safe_getsize(expand_env(pa)) if os.path.isfile(expand_env(pa)) else 0
             except: pass
             self.sig.est.emit(idx,e); self.sig.prog.emit(n,len(its))
@@ -1932,6 +2027,27 @@ class CleanPage(ScrollArea):
     def do_clean(self):
         self.tbl.setDragEnabled(False)
         self._sync()
+        selected_rules = [parse_rule_entry(t) for t in self.targets if t[3]]
+        selected_rules = [t for t in selected_rules if t]
+
+        risky_lines = []
+        for entry in selected_rules:
+            risk = get_rule_runtime_risk(entry)
+            if risk:
+                risky_lines.append(risk)
+
+        if risky_lines:
+            preview = risky_lines[:8]
+            if len(risky_lines) > 8:
+                preview.append(f"另有 {len(risky_lines) - 8} 项未展开")
+            content = (
+                "当前勾选项中检测到高风险清理规则：\n\n"
+                + "\n".join(f"- {line}" for line in preview)
+                + "\n\n这些规则可能影响系统、程序或用户目录。是否继续清理？"
+            )
+            if not MessageBox("风险提示", content, self.window()).exec():
+                self.tbl.setDragEnabled(True)
+                return
         if self.chk_perm.isChecked():
             if not MessageBox("确认", "当前为强力模式，删除后无法恢复继续？", self.window()).exec(): 
                 self.tbl.setDragEnabled(True)
@@ -1940,14 +2056,15 @@ class CleanPage(ScrollArea):
     
     def _cln_w(self):
         t0 = time.time()
-        import fnmatch; pm=self.chk_perm.isChecked(); sel=[(n,p,t) for n,p,t,en,_,_ in self.targets if en]
+        import fnmatch; pm=self.chk_perm.isChecked(); sel=[parse_rule_entry(t) for t in self.targets if t[3]]
+        sel=[t for t in sel if t]
         if not sel: return
         
         # 清理前创建还原点
         self._try_rst()
         
         ok=fl=st=0; tot=len(sel); lf=lambda s:self.sig.log.emit(s)
-        for nm,pa,tp in sel:
+        for nm, pa, tp, _, nt, _, pattern in sel:
             if self.stop.is_set():
                 self.sig.done.emit(f"清理已取消：成功 {ok}，失败 {fl}，耗时 {time.time()-t0:.1f} 秒")
                 return
@@ -1959,9 +2076,10 @@ class CleanPage(ScrollArea):
                         if delete_path(os.path.join(p,e),pm,lf): ok+=1
                         else: fl+=1
                 elif tp=="glob" and os.path.isdir(p):
+                    rule_pattern = normalize_rule_pattern(tp, pattern, nt)
                     for f in os.listdir(p):
                         if self.stop.is_set(): break
-                        if fnmatch.fnmatch(f.lower(),"thumbcache*.db"):
+                        if fnmatch.fnmatch(f.lower(), rule_pattern.lower()):
                             if delete_path(os.path.join(p,f),pm,lf): ok+=1
                             else: fl+=1
                 elif tp=="file" and os.path.exists(p):
@@ -2921,12 +3039,13 @@ class MainWindow(FluentWindow):
                     self.global_settings.update(json.load(f))
             except: pass
 
-        self.targets = default_clean_targets()
+        self.targets = [parse_rule_entry(t) for t in default_clean_targets()]
+        self.targets = [t for t in self.targets if t]
         # 记录内置默认规则身份，后续删除保护只针对这批规则
-        self.builtin_rule_keys = {make_rule_key(t[0], t[1], t[2]) for t in self.targets}
+        self.builtin_rule_keys = {make_rule_key(t[0], t[1], t[2], t[6]) for t in self.targets}
         self.deleted_builtin_rule_keys = load_rule_keys(self.global_settings.get("deleted_builtin_rules", []))
         if self.deleted_builtin_rule_keys:
-            self.targets = [t for t in self.targets if make_rule_key(t[0], t[1], t[2]) not in self.deleted_builtin_rule_keys]
+            self.targets = [t for t in self.targets if make_rule_key(t[0], t[1], t[2], t[6]) not in self.deleted_builtin_rule_keys]
         
         # 2. 附加自定义规则
         if os.path.exists(self.custom_rules_path):
@@ -2936,10 +3055,9 @@ class MainWindow(FluentWindow):
                 # 只要是从 custom_rules_path 读入，都视为“自定义规则”，强制 is_custom=True，
                 # 这样仅内置 default_clean_targets() 会保持受保护状态
                 for c in customs:
-                    if not isinstance(c, (list, tuple)) or len(c) < 5:
-                        continue
-                    nm, pa, tp, en, nt = c[0], c[1], c[2], c[3], c[4]
-                    self.targets.append((nm, pa, tp, en, nt, True))
+                    parsed = parse_rule_entry(c, force_custom=True)
+                    if parsed:
+                        self.targets.append(parsed)
             except: pass
 
         # 3. 恢复排序与勾选状态
@@ -2965,9 +3083,9 @@ class MainWindow(FluentWindow):
                     self.targets = new_targets
 
                 for i in range(len(self.targets)):
-                    nm, pa, tp, en, nt, is_c = self.targets[i]
+                    nm, pa, tp, en, nt, is_c, pattern = self.targets[i]
                     if nm in states:
-                        self.targets[i] = (nm, pa, tp, states[nm], nt, is_c)
+                        self.targets[i] = (nm, pa, tp, states[nm], nt, is_c, pattern)
             except: pass
                 
         self.stop = threading.Event(); self.sig = Sig()
@@ -3288,8 +3406,7 @@ class MainWindow(FluentWindow):
             if latest and _version_key(latest[0]) > _version_key(CURRENT_VERSION):
                 self.sig.update_found.emit(latest[0], latest[1], latest[2])
             elif manual:
-                channel_text = "测试版" if self.global_settings.get("update_channel", "stable") == "beta" else "稳定版"
-                self.sig.update_status.emit("success", "已是最新版本", f"当前 {channel_text} 通道没有发现比 v{CURRENT_VERSION} 更新的版本")
+                self.sig.update_status.emit("success", "提示", "当前已是最新版本")
         except Exception as e:
             self.sig.update_latest.emit("最新版本：获取失败")
             if manual:
