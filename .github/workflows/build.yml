@@ -40,7 +40,11 @@ jobs:
       shell: bash
       run: |
         # 从 main.py 中匹配 CURRENT_VERSION = "x.x.x" 这一行，提取引号内的版本号
-        VERSION=$(grep -oP 'CURRENT_VERSION\s*=\s*"\K[^"]+' main.py)
+        VERSION=$(grep -oE 'CURRENT_VERSION\s*=\s*"[^"]+"' main.py | grep -oE '"[^"]+"' | tr -d '"')
+        if [ -z "$VERSION" ]; then
+          echo "❌ 错误：无法从 main.py 中提取 CURRENT_VERSION"
+          exit 1
+        fi
         echo "RELEASE_TAG=v${VERSION}" >> $GITHUB_ENV
         echo "提取到版本号: v${VERSION}"
 
