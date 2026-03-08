@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-C盘强力清理工具 v0.2.9-alpha02
+C盘强力清理工具 v0.2.9
 PySide6 + PySide6-Fluent-Widgets (Fluent2 UI)
 包含：常规清理(支持拖拽排序与自定义规则)、大文件扫描、重复文件、空文件夹、无效快捷方式
 """
@@ -35,7 +35,7 @@ from qfluentwidgets import (
 # ══════════════════════════════════════════════════════════
 #  版本与更新配置
 # ══════════════════════════════════════════════════════════
-CURRENT_VERSION = "0.2.9-alpha02"
+CURRENT_VERSION = "0.2.9"
 UPDATE_JSON_URL = "https://gitee.com/kio0/c_cleaner_plus/raw/master/update.json"
 
 from qfluentwidgets.components.widgets.table_view import TableItemDelegate
@@ -639,6 +639,7 @@ BIGFILE_OPTIONAL_SKIP_NAMES = {"pagefile.sys", "hiberfil.sys", "swapfile.sys", "
 BIGFILE_OPTIONAL_SKIP_EXT = {
     ".vhd", ".vhdx", ".avhd", ".avhdx", ".vmdk", ".vdi", ".qcow", ".qcow2", ".ova", ".ovf"
 }
+DUPLICATE_GROUP_DISPLAY_LIMIT = 200
 LOG_MAX_LINES = 1000
 
 def should_exclude(p, prefixes):
@@ -2906,7 +2907,7 @@ class MoreCleanPage(ScrollArea):
         self.btn_sel_all.clicked.connect(self.toggle_sel_all); br.addWidget(self.btn_sel_all)
 
         b2=PushButton(FIF.DELETE,"清理已勾选"); b2.setFixedHeight(30); b2.clicked.connect(self.do_del); br.addWidget(b2)
-        b3=PushButton(FIF.CANCEL,"停止"); b3.setFixedHeight(30); b3.clicked.connect(lambda:self.stop.set()); br.addWidget(b3); br.addStretch(); v.addLayout(br)
+        b3=PushButton(FIF.CANCEL,"停止"); b3.setFixedHeight(30); b3.clicked.connect(self._stop_current); br.addWidget(b3); br.addStretch(); v.addLayout(br)
 
         pg=QHBoxLayout(); self.pb=ProgressBar(); self.pb.setRange(0,100); self.pb.setValue(0); self.pb.setFixedHeight(3)
         pg.addWidget(self.pb,1); self.sl=CaptionLabel("就绪"); pg.addWidget(self.sl); v.addLayout(pg)
@@ -2959,6 +2960,9 @@ class MoreCleanPage(ScrollArea):
         self.btn_drives.setText(txt)
         self.btn_drives.setToolTip(f"已选磁盘: {', '.join(sel)}" if sel else "未选择磁盘")
 
+    def _stop_current(self):
+        self.stop.set()
+
     def do_scan(self):
         idx = self.cb_mode.currentIndex(); roots = [d for d, state in self.drive_states.items() if state]
         if idx not in (3, 4) and not roots: self.sig.done.emit("错误：未选择磁盘"); return
@@ -2975,61 +2979,26 @@ class MoreCleanPage(ScrollArea):
         elif idx == 3: threading.Thread(target=self._scan_registry, daemon=True).start()
         elif idx == 4: threading.Thread(target=self._scan_context_menu, daemon=True).start()
 
-    def _collect_files_threaded(self, roots, excl, workers, ext_filter=None):
-        dir_queue = queue.Queue(); res_files = []; res_dirs = []; lock = threading.Lock()
-        for r in roots: dir_queue.put(r)
-        def _worker():
-            while not self.stop.is_set():
-                try: d = dir_queue.get(timeout=0.05)
-                except queue.Empty: continue
-                if d is _SENTINEL: dir_queue.put(_SENTINEL); break
-                try: entries = os.scandir(d)
-                except: dir_queue.task_done(); continue
-                lf = []; ld = []
-                try:
-                    for e in entries:
-                        if self.stop.is_set(): break
-                        try:
-                            if e.is_symlink(): continue
-                            if e.is_dir(follow_symlinks=False):
-                                if not should_exclude(e.path, excl): dir_queue.put(e.path); ld.append(e.path)
-                            elif e.is_file(follow_symlinks=False):
-                                if ext_filter and not e.name.lower().endswith(ext_filter): continue
-                                lf.append((e.stat(follow_symlinks=False).st_size, e.path))
-                        except: pass
-                finally:
-                    try: entries.close()
-                    except: pass
-                with lock:
-                    if lf: res_files.extend(lf)
-                    if ld: res_dirs.extend(ld)
-                dir_queue.task_done()
-        threads = []
-        for _ in range(workers): t = threading.Thread(target=_worker, daemon=True); t.start(); threads.append(t)
-        while not self.stop.is_set():
-            try:
-                dir_queue.all_tasks_done.acquire()
-                if dir_queue.unfinished_tasks == 0: dir_queue.all_tasks_done.release(); break
-                dir_queue.all_tasks_done.release()
-            except: pass
-            time.sleep(0.1)
-        dir_queue.put(_SENTINEL); [t.join(timeout=1) for t in threads]
-        return res_files, res_dirs
-
-    def _walk_files_threaded(self, roots, excl, workers, file_cb=None, dir_cb=None, ext_filter=None):
+    def _walk_files_threaded(self, roots, excl, workers, file_cb=None, dir_cb=None, ext_filter=None, collect_files=False, collect_dirs=False):
         dir_queue = queue.Queue()
+        res_files = []
+        res_dirs = []
+        lock = threading.Lock()
         for r in roots:
             dir_queue.put(r)
 
         def _worker():
-            while not self.stop.is_set():
+            while True:
                 try:
                     d = dir_queue.get(timeout=0.05)
                 except queue.Empty:
                     continue
                 if d is _SENTINEL:
-                    dir_queue.put(_SENTINEL)
+                    dir_queue.task_done()
                     break
+                if self.stop.is_set():
+                    dir_queue.task_done()
+                    continue
                 try:
                     entries = os.scandir(d)
                 except:
@@ -3045,13 +3014,20 @@ class MoreCleanPage(ScrollArea):
                             if e.is_dir(follow_symlinks=False):
                                 if not should_exclude(e.path, excl):
                                     dir_queue.put(e.path)
+                                    if collect_dirs:
+                                        with lock:
+                                            res_dirs.append(e.path)
                                     if dir_cb:
                                         dir_cb(e.path)
                             elif e.is_file(follow_symlinks=False):
                                 if ext_filter and not e.name.lower().endswith(ext_filter):
                                     continue
+                                file_info = (e.stat(follow_symlinks=False).st_size, e.path)
+                                if collect_files:
+                                    with lock:
+                                        res_files.append(file_info)
                                 if file_cb:
-                                    file_cb(e.stat(follow_symlinks=False).st_size, e.path)
+                                    file_cb(file_info[0], file_info[1])
                         except:
                             pass
                 finally:
@@ -3066,65 +3042,81 @@ class MoreCleanPage(ScrollArea):
             t = threading.Thread(target=_worker, daemon=True)
             t.start()
             threads.append(t)
-        while not self.stop.is_set():
-            try:
-                dir_queue.all_tasks_done.acquire()
-                if dir_queue.unfinished_tasks == 0:
-                    dir_queue.all_tasks_done.release()
-                    break
-                dir_queue.all_tasks_done.release()
-            except:
-                pass
-            time.sleep(0.1)
-        dir_queue.put(_SENTINEL)
-        [t.join(timeout=1) for t in threads]
+        join_done = threading.Event()
+        threading.Thread(target=lambda: (dir_queue.join(), join_done.set()), daemon=True).start()
+        sent_stop_signal = False
+
+        while not join_done.wait(0.1):
+            if self.stop.is_set() and not sent_stop_signal:
+                for _ in threads:
+                    dir_queue.put(_SENTINEL)
+                sent_stop_signal = True
+
+        if not sent_stop_signal:
+            for _ in threads:
+                dir_queue.put(_SENTINEL)
+        for t in threads:
+            t.join(timeout=1)
+        return res_files, res_dirs
 
     def _scan_duplicates(self, roots, workers):
         t0 = time.time()
-        size_counts = defaultdict(int)
+        first_path_by_size = {}
+        size_groups = defaultdict(list)
         size_lock = threading.Lock()
 
-        self.sig.log.emit("[重复文件] 第一阶段：统计文件大小...")
+        self.sig.log.emit("[重复文件] 第一阶段：识别可疑大小分组...")
 
-        def _count_by_size(file_size, path):
+        def _collect_candidates(file_size, path):
             if file_size <= 0:
                 return
             with size_lock:
-                size_counts[file_size] += 1
+                existing_group = size_groups.get(file_size)
+                if existing_group:
+                    existing_group.append(path)
+                    return
 
-        self._walk_files_threaded(roots, DEFAULT_EXCLUDES, workers, file_cb=_count_by_size)
+                first_path = first_path_by_size.get(file_size)
+                if first_path is None:
+                    first_path_by_size[file_size] = path
+                    return
+
+                size_groups[file_size] = [first_path, path]
+                first_path_by_size.pop(file_size, None)
+
+        self._walk_files_threaded(roots, DEFAULT_EXCLUDES, workers, file_cb=_collect_candidates)
         if self.stop.is_set():
             self.sig.done.emit(f"扫描已取消，耗时 {time.time()-t0:.1f} 秒")
             return
 
-        suspect_sizes = {sz for sz, count in size_counts.items() if count > 1}
-        size_counts.clear()
-        if not suspect_sizes:
+        first_path_by_size.clear()
+        if not size_groups:
             self.sig.done.emit(f"扫描完成，找到 0 个重复文件，耗时 {time.time()-t0:.1f} 秒")
             return
 
-        self.sig.log.emit(f"[重复文件] 第二阶段：收集 {len(suspect_sizes)} 个可疑大小分组...")
-        size_dict = defaultdict(list)
-        path_lock = threading.Lock()
+        suspects = [(sz, paths) for sz, paths in size_groups.items() if len(paths) > 1]
+        self.sig.log.emit(f"[重复文件] 第二阶段：校验 {len(suspects)} 个可疑大小分组...")
 
-        def _collect_suspects(file_size, path):
-            if file_size not in suspect_sizes:
-                return
-            with path_lock:
-                size_dict[file_size].append(path)
-
-        self._walk_files_threaded(roots, DEFAULT_EXCLUDES, workers, file_cb=_collect_suspects)
-        if self.stop.is_set():
-            self.sig.done.emit(f"扫描已取消，耗时 {time.time()-t0:.1f} 秒")
-            return
-
-        suspects = [(sz, paths) for sz, paths in size_dict.items() if len(paths) > 1]
-
-        def _get_hash(path, head_bytes=None, tail_bytes=0):
+        def _get_hash(path, head_bytes=None, tail_bytes=0, sample_offsets=None):
             m = hashlib.md5()
             try:
                 with open(path, 'rb') as f:
-                    if head_bytes is not None:
+                    if sample_offsets:
+                        try:
+                            file_size = os.path.getsize(path)
+                        except Exception:
+                            file_size = 0
+                        seen_offsets = set()
+                        for offset, size in sample_offsets:
+                            if size <= 0 or file_size <= 0:
+                                continue
+                            real_offset = max(0, min(offset, max(0, file_size - size)))
+                            if real_offset in seen_offsets:
+                                continue
+                            seen_offsets.add(real_offset)
+                            f.seek(real_offset)
+                            m.update(f.read(size))
+                    elif head_bytes is not None:
                         head = f.read(head_bytes)
                         m.update(head)
                         if tail_bytes > 0:
@@ -3142,7 +3134,24 @@ class MoreCleanPage(ScrollArea):
             except:
                 return None
 
-        # 先按文件大小筛，再用首尾分块签名做快速分桶，最后只对疑似组做全量哈希。
+        def _get_quick_hash(path, file_size):
+            if file_size <= 8 * 1024:
+                return _get_hash(path)
+            if file_size <= 512 * 1024:
+                return _get_hash(path, head_bytes=64 * 1024)
+            sample_size = 64 * 1024
+            mid_offset = max(0, (file_size // 2) - (sample_size // 2))
+            tail_offset = max(0, file_size - sample_size)
+            return _get_hash(
+                path,
+                sample_offsets=[
+                    (0, sample_size),
+                    (mid_offset, sample_size),
+                    (tail_offset, sample_size)
+                ]
+            )
+
+        # 先按文件大小筛，再用分层采样做快速分桶，最后只对疑似组做全量哈希。
         results = []
         tot = len(suspects)
         for i, (file_size, paths) in enumerate(suspects, 1):
@@ -3151,10 +3160,7 @@ class MoreCleanPage(ScrollArea):
 
             quick_dict = defaultdict(list)
             for p in paths:
-                if file_size <= 8192:
-                    sig = _get_hash(p)
-                else:
-                    sig = _get_hash(p, head_bytes=4096, tail_bytes=4096)
+                sig = _get_quick_hash(p, file_size)
                 if sig:
                     quick_dict[sig].append(p)
 
@@ -3174,15 +3180,32 @@ class MoreCleanPage(ScrollArea):
             self.sig.done.emit(f"扫描已取消，耗时 {time.time()-t0:.1f} 秒")
             return
 
+        normalized_results = []
+        for file_size, duplicates in results:
+            sorted_duplicates = sorted(duplicates, key=lambda p: os.path.normcase(p))
+            if len(sorted_duplicates) > 1:
+                normalized_results.append((file_size, sorted_duplicates))
+        normalized_results.sort(key=lambda item: (-item[0], os.path.normcase(item[1][0])))
+
         cnt = 0
-        for grp_id, (file_size, dup_list) in enumerate(results, 1):
-            for idx, p in enumerate(dup_list):
+        hidden_cnt = 0
+        for grp_id, (file_size, dup_list) in enumerate(normalized_results, 1):
+            shown_list = dup_list[:DUPLICATE_GROUP_DISPLAY_LIMIT]
+            hidden = max(0, len(dup_list) - len(shown_list))
+            for idx, p in enumerate(shown_list):
                 self.sig.more_add.emit((idx > 0), "重复文件", f"组 {grp_id}", human_size(file_size), p); cnt += 1
+            if hidden > 0:
+                hidden_cnt += hidden
+                self.sig.more_add.emit(False, "重复文件", f"组 {grp_id}", f"{human_size(file_size)} | 另有 {hidden} 个未展开", "")
+        if hidden_cnt > 0:
+            self.sig.log.emit(f"[重复文件] 已折叠 {hidden_cnt} 个超大重复组结果，仅展示每组前 {DUPLICATE_GROUP_DISPLAY_LIMIT} 项")
+            self.sig.done.emit(f"扫描完成，展示 {cnt} 个重复文件，另有 {hidden_cnt} 个未展开，耗时 {time.time()-t0:.1f} 秒")
+            return
         self.sig.done.emit(f"扫描完成，找到 {cnt} 个重复文件，耗时 {time.time()-t0:.1f} 秒")
 
     def _scan_empty_dirs(self, roots, workers):
         t0 = time.time()
-        _, dirs = self._collect_files_threaded(roots, DEFAULT_EXCLUDES, workers)
+        _, dirs = self._walk_files_threaded(roots, DEFAULT_EXCLUDES, workers, collect_dirs=True)
         if self.stop.is_set():
             self.sig.done.emit(f"扫描已取消，耗时 {time.time()-t0:.1f} 秒")
             return
@@ -3204,7 +3227,7 @@ class MoreCleanPage(ScrollArea):
 
     def _scan_shortcuts(self, roots, workers):
         t0 = time.time()
-        files, _ = self._collect_files_threaded(roots, DEFAULT_EXCLUDES, workers, ext_filter=".lnk")
+        files, _ = self._walk_files_threaded(roots, DEFAULT_EXCLUDES, workers, ext_filter=".lnk", collect_files=True)
         if self.stop.is_set():
             self.sig.done.emit(f"扫描已取消，耗时 {time.time()-t0:.1f} 秒")
             return
@@ -3429,12 +3452,12 @@ class MainWindow(FluentWindow):
                         self.targets[i] = (nm, pa, tp, states[nm], nt, is_c, pattern)
             except: pass
                 
-        self.stop = threading.Event(); self.big_stop = threading.Event(); self.sig = Sig()
+        self.stop = threading.Event(); self.big_stop = threading.Event(); self.more_stop = threading.Event(); self.sig = Sig()
         self.pg_clean = CleanPage(self.sig, self.targets, self.stop, self)
         self.pg_rule_store = RuleStorePage(self, self)
         self.pg_big = BigFilePage(self.sig, self.big_stop, self)
         self.pg_uninstall = UninstallPage(self.sig, self.stop, self)
-        self.pg_more = MoreCleanPage(self.sig, self.stop, self)
+        self.pg_more = MoreCleanPage(self.sig, self.more_stop, self)
         self.pg_setting = SettingPage(self, self)
         self._update_checking = False
         
