@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-C盘强力清理工具 v0.2.9
+C盘强力清理工具 v0.3.0-alpha01
 PySide6 + PySide6-Fluent-Widgets (Fluent2 UI)
 包含：常规清理(支持拖拽排序与自定义规则)、大文件扫描、重复文件、空文件夹、无效快捷方式
 """
@@ -35,7 +35,7 @@ from qfluentwidgets import (
 # ══════════════════════════════════════════════════════════
 #  版本与更新配置
 # ══════════════════════════════════════════════════════════
-CURRENT_VERSION = "0.2.9"
+CURRENT_VERSION = "0.3.0-alpha01"
 UPDATE_JSON_URL = "https://gitee.com/kio0/c_cleaner_plus/raw/master/update.json"
 
 from qfluentwidgets.components.widgets.table_view import TableItemDelegate
@@ -205,6 +205,19 @@ class LeftAlignedPushButton(PushButton):
         painter.setPen(self.palette().buttonText().color())
         rect = self.rect().adjusted(12, 0, -12, 0)
         painter.drawText(rect, int(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter), self._display_text)
+
+
+class SizeTableWidgetItem(QTableWidgetItem):
+    def __lt__(self, other):
+        if isinstance(other, QTableWidgetItem):
+            left = self.data(Qt.ItemDataRole.UserRole)
+            right = other.data(Qt.ItemDataRole.UserRole)
+            if left is not None and right is not None:
+                try:
+                    return int(left) < int(right)
+                except Exception:
+                    pass
+        return super().__lt__(other)
 
 # ══════════════════════════════════════════════════════════
 #  支持完美拖拽排序的 TableWidget
@@ -1879,11 +1892,17 @@ class SettingPage(ScrollArea):
 class CleanPage(ScrollArea):
     def __init__(self, sig, targets, stop, parent=None):
         super().__init__(parent); self.sig=sig; self.targets=targets; self.stop=stop
+        self.estimated_sizes = {}
         self.view=QWidget(); self.setWidget(self.view); self.setWidgetResizable(True); self.setObjectName("cleanPage"); self.enableTransparentBackground()
         v=QVBoxLayout(self.view); v.setContentsMargins(28,12,28,20); v.setSpacing(8)
-        v.addLayout(make_title_row(FIF.BROOM, "常规清理"))
+        title_row = make_title_row(FIF.BROOM, "常规清理")
         badge = "管理员" if is_admin() else "非管理员"
-        v.addWidget(CaptionLabel(f"当前权限：{badge}  |  长按或框选项目可拖动排序"))
+        lbl_perm = CaptionLabel(f"当前权限：{badge}  |  长按或框选项目可拖动排序")
+        setFont(lbl_perm, 11, QFont.Weight.Normal)
+        lbl_perm.setTextColor(QColor(128, 128, 128))
+        title_row.insertSpacing(2, 2) 
+        title_row.insertWidget(3, lbl_perm, 0, Qt.AlignmentFlag.AlignBottom)
+        v.addLayout(title_row)
 
         search_row = QHBoxLayout()
         self.search_input = SearchLineEdit()
@@ -1891,12 +1910,18 @@ class CleanPage(ScrollArea):
         self.search_input.setFixedWidth(320)
         self.search_input.textChanged.connect(self._filter_rules)
         search_row.addWidget(self.search_input)
+        search_row.addSpacing(10)
+        self.cb_sort = ComboBox()
+        self.cb_sort.addItems(["默认顺序", "按名称", "按路径", "按大小"])
+        self.cb_sort.setFixedWidth(120)
+        self.cb_sort.currentIndexChanged.connect(self._on_sort_mode_changed)
+        search_row.addWidget(self.cb_sort)
         search_row.addStretch()
         v.addLayout(search_row)
 
         opt=QHBoxLayout(); opt.setSpacing(8)
         self.chk_perm=CheckBox("强力模式：永久删除"); self.chk_perm.setChecked(True); opt.addWidget(self.chk_perm)
-        self.chk_rst=CheckBox("创建还原点"); opt.addWidget(self.chk_rst) 
+        self.chk_rst=CheckBox("创建还原点"); opt.addWidget(self.chk_rst)
         opt.addStretch()
         
         b_add = PushButton(FIF.ADD, "新建"); b_add.clicked.connect(self.do_add_rule); opt.addWidget(b_add)
@@ -1909,6 +1934,7 @@ class CleanPage(ScrollArea):
         self.tbl.verticalHeader().setVisible(False)
         self.tbl.horizontalHeader().setStretchLastSection(True)
         self.tbl.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu); self.tbl.customContextMenuRequested.connect(lambda p: make_ctx(self,self.tbl,p,2))
+        self.tbl.setSortingEnabled(False)
         
         self.reload_table() # 初始化时渲染表格
         
@@ -1930,20 +1956,45 @@ class CleanPage(ScrollArea):
 
     def reload_table(self):
         self.tbl.setRowCount(0)
-        self.tbl.setRowCount(len(self.targets))
-        for i, entry in enumerate(self.targets):
+        display_entries = self._get_display_entries()
+        self.tbl.setRowCount(len(display_entries))
+        for i, (src_idx, entry) in enumerate(display_entries):
             nm, pa, tp, en, nt, is_c, pattern = parse_rule_entry(entry)
             disp_name = f"{nm} (自定义)" if is_c else nm
             chk_item = make_check_item(en)
             name_item = QTableWidgetItem(disp_name)
-            name_item.setData(Qt.ItemDataRole.UserRole, (nm, pa, tp, is_c, pattern))
+            name_item.setData(Qt.ItemDataRole.UserRole, (src_idx, nm, pa, tp, is_c, pattern))
             
             self.tbl.setItem(i, 0, chk_item)
             self.tbl.setItem(i, 1, name_item)
             self.tbl.setItem(i, 2, QTableWidgetItem(rule_display_target(pa, tp, pattern)))
             self.tbl.setItem(i, 3, QTableWidgetItem(nt))
-            self.tbl.setItem(i, 4, QTableWidgetItem(""))
+            size_item = SizeTableWidgetItem("")
+            size_val = self.estimated_sizes.get(self._rule_cache_key(entry), 0)
+            size_item.setData(Qt.ItemDataRole.UserRole, size_val)
+            size_item.setText(human_size(size_val) if size_val > 0 else "")
+            self.tbl.setItem(i, 4, size_item)
         self._filter_rules(self.search_input.text())
+
+    def _rule_cache_key(self, entry):
+        nm, pa, tp, _, _, _, pattern = parse_rule_entry(entry)
+        return make_rule_key(nm, pa, tp, pattern)
+
+    def _get_display_entries(self):
+        items = list(enumerate(self.targets))
+        mode = self.cb_sort.currentIndex() if hasattr(self, "cb_sort") else 0
+        if mode == 1:
+            items.sort(key=lambda x: str(parse_rule_entry(x[1])[0]).lower())
+        elif mode == 2:
+            items.sort(key=lambda x: rule_display_target(parse_rule_entry(x[1])[1], parse_rule_entry(x[1])[2], parse_rule_entry(x[1])[6]).lower())
+        elif mode == 3:
+            items.sort(key=lambda x: self.estimated_sizes.get(self._rule_cache_key(x[1]), 0), reverse=True)
+        return items
+
+    def _on_sort_mode_changed(self, _):
+        is_default = self.cb_sort.currentIndex() == 0
+        self.tbl.setDragEnabled(is_default)
+        self.reload_table()
 
     def _filter_rules(self, text):
         query = str(text or "").strip().lower()
@@ -1964,29 +2015,34 @@ class CleanPage(ScrollArea):
                 all_checked = False; break
         new_state = not all_checked
         for r in rows: set_row_checked(self.tbl, r, new_state)
-            
+        self._sync()
+        
         if new_state:
             self.btn_sel_all.setText("取消全选"); self.btn_sel_all.setIcon(FIF.CLOSE)
         else:
             self.btn_sel_all.setText("全选"); self.btn_sel_all.setIcon(FIF.ACCEPT)
-        self._sync()
 
     def _sync(self):
         new_targets = []
+        mode = self.cb_sort.currentIndex() if hasattr(self, "cb_sort") else 0
         for r in range(self.tbl.rowCount()):
             name_item = self.tbl.item(r, 1)
             if not name_item: continue
             
             user_data = name_item.data(Qt.ItemDataRole.UserRole)
             if user_data:
-                nm, pa, tp, is_c, pattern = user_data
+                src_idx, nm, pa, tp, is_c, pattern = user_data
             else: continue
                 
             en = is_row_checked(self.tbl, r)
             nt = self.tbl.item(r, 3).text() if self.tbl.item(r, 3) else ""
-            new_targets.append((nm, pa, tp, en, nt, is_c, normalize_rule_pattern(tp, pattern, nt)))
+            new_entry = (nm, pa, tp, en, nt, is_c, normalize_rule_pattern(tp, pattern, nt))
+            if mode == 0:
+                new_targets.append(new_entry)
+            elif 0 <= src_idx < len(self.targets):
+                self.targets[src_idx] = new_entry
         
-        if new_targets:
+        if mode == 0 and new_targets:
             self.targets[:] = new_targets
 
     def _try_rst(self):
@@ -2026,16 +2082,7 @@ class CleanPage(ScrollArea):
                 InfoBar.error("错误", "glob 规则必须填写匹配模式", parent=self.window()); return
             new_rule = (nm, pa, tp, en, nt, is_c, pattern)
             self.targets.append(new_rule)
-            r = self.tbl.rowCount(); self.tbl.setRowCount(r + 1)
-            name_item = QTableWidgetItem(nm + " (自定义)")
-            name_item.setData(Qt.ItemDataRole.UserRole, (nm, pa, tp, is_c, pattern))
-            
-            self.tbl.setItem(r, 0, make_check_item(en))
-            self.tbl.setItem(r, 1, name_item)
-            self.tbl.setItem(r, 2, QTableWidgetItem(rule_display_target(pa, tp, pattern)))
-            self.tbl.setItem(r, 3, QTableWidgetItem(nt))
-            self.tbl.setItem(r, 4, QTableWidgetItem(""))
-            self._filter_rules(self.search_input.text())
+            self.reload_table()
             self.save_custom_rules()
             InfoBar.success("成功", f"规则 '{nm}' 已添加！", parent=self.window())
 
@@ -2104,15 +2151,6 @@ class CleanPage(ScrollArea):
             if (nm, pa, tp, is_c, pattern) in del_key_set:
                 self.targets.pop(i)
 
-        # 再删表格行（倒序）
-        for r in range(self.tbl.rowCount() - 1, -1, -1):
-            it = self.tbl.item(r, 1)
-            if not it:
-                continue
-            ud = it.data(Qt.ItemDataRole.UserRole)
-            if ud and tuple(ud) in del_key_set:
-                self.tbl.removeRow(r)
-
         if deleted_builtin_now:
             deleted_keys = getattr(self.window(), "deleted_builtin_rule_keys", set())
             deleted_keys.update(deleted_builtin_now)
@@ -2120,6 +2158,7 @@ class CleanPage(ScrollArea):
             self.window().global_settings["deleted_builtin_rules"] = [list(k) for k in sorted(deleted_keys)]
             self.window().save_global_settings()
 
+        self.reload_table()
         self.save_custom_rules()
         if protected_count > 0:
             InfoBar.success(
@@ -2163,15 +2202,9 @@ class CleanPage(ScrollArea):
                 nm, pa, tp, en, nt, is_custom, pattern = parsed
                 existing_keys.add(rule_key)
                 self.targets.append(parsed)
-                r = self.tbl.rowCount(); self.tbl.setRowCount(r + 1)
-                name_item = QTableWidgetItem(nm + " (自定义)")
-                name_item.setData(Qt.ItemDataRole.UserRole, (nm, pa, tp, is_custom, pattern))
-                
-                self.tbl.setItem(r, 0, make_check_item(en)); self.tbl.setItem(r, 1, name_item)
-                self.tbl.setItem(r, 2, QTableWidgetItem(rule_display_target(pa, tp, pattern))); self.tbl.setItem(r, 3, QTableWidgetItem(nt)); self.tbl.setItem(r, 4, QTableWidgetItem(""))
                 added += 1
             if added > 0:
-                self._filter_rules(self.search_input.text())
+                self.reload_table()
                 self.save_custom_rules()
                 msg = f"{source_name} 已导入 {added} 条规则"
                 if skipped > 0:
@@ -2184,6 +2217,26 @@ class CleanPage(ScrollArea):
         except Exception as e:
             InfoBar.error("导入失败", f"文件读取错误: {e}", parent=self.window())
             return False
+
+    def apply_estimate(self, idx, size_val):
+        if not (0 <= idx < len(self.targets)):
+            return
+        entry = self.targets[idx]
+        self.estimated_sizes[self._rule_cache_key(entry)] = size_val
+        if hasattr(self, "cb_sort") and self.cb_sort.currentIndex() == 3:
+            self.reload_table()
+            return
+        for row in range(self.tbl.rowCount()):
+            name_item = self.tbl.item(row, 1)
+            if not name_item:
+                continue
+            user_data = name_item.data(Qt.ItemDataRole.UserRole)
+            if user_data and user_data[0] == idx:
+                item = self.tbl.item(row, 4)
+                if item:
+                    item.setData(Qt.ItemDataRole.UserRole, size_val)
+                    item.setText(human_size(size_val) if size_val > 0 else "")
+                break
 
     def do_import_rules(self):
         path, _ = QFileDialog.getOpenFileName(
@@ -2749,6 +2802,11 @@ class BigFilePage(ScrollArea):
         pr=QHBoxLayout(); pr.setSpacing(10); pr.addWidget(CaptionLabel("最小文件MB:"))
         self.sp_mb=SpinBox(); self.sp_mb.setRange(50,10240); self.sp_mb.setValue(500); self.sp_mb.setFixedWidth(130); pr.addWidget(self.sp_mb)
         pr.addWidget(CaptionLabel("扫描上限:")); self.sp_mx=SpinBox(); self.sp_mx.setRange(50,2000); self.sp_mx.setValue(200); self.sp_mx.setFixedWidth(130); pr.addWidget(self.sp_mx)
+        self.cb_sort = ComboBox()
+        self.cb_sort.addItems(["默认顺序", "按文件名", "按大小", "按路径"])
+        self.cb_sort.setFixedWidth(120)
+        self.cb_sort.currentIndexChanged.connect(self._apply_sort)
+        pr.addWidget(self.cb_sort)
         self.chk_skip_special=CheckBox("跳过系统/虚拟机大文件"); self.chk_skip_special.setChecked(True); self.chk_skip_special.setToolTip("跳过分页/休眠/内存转储以及常见虚拟机磁盘镜像")
         pr.addWidget(self.chk_skip_special)
         self.chk_perm=CheckBox("永久删除"); self.chk_perm.setChecked(True); pr.addWidget(self.chk_perm); pr.addStretch(); v.addLayout(pr)
@@ -2810,6 +2868,15 @@ class BigFilePage(ScrollArea):
 
     def _stop_current(self):
         self.stop.set()
+
+    def _apply_sort(self, _=None):
+        mode = self.cb_sort.currentIndex() if hasattr(self, "cb_sort") else 0
+        self.tbl.setSortingEnabled(mode != 0)
+        if mode == 0:
+            return
+        column = {1: 1, 2: 2, 3: 3}.get(mode, 2)
+        order = Qt.SortOrder.AscendingOrder if mode in (1, 3) else Qt.SortOrder.DescendingOrder
+        self.tbl.sortItems(column, order)
 
     def do_scan(self):
         self.stop.clear(); self.btn_sel_all.setText("全选"); self.btn_sel_all.setIcon(FIF.ACCEPT)
@@ -3807,12 +3874,11 @@ class MainWindow(FluentWindow):
                 p.pb.setValue(v)
 
     def _est(self, idx, val):
-        if 0<=idx<self.pg_clean.tbl.rowCount():
-            try:
-                safe_val = max(0, int(val))
-            except Exception:
-                safe_val = 0
-            it=self.pg_clean.tbl.item(idx,4); it.setText(human_size(safe_val)) if it else None
+        try:
+            safe_val = max(0, int(val))
+        except Exception:
+            safe_val = 0
+        self.pg_clean.apply_estimate(idx, safe_val)
 
     def _big_prog(self, v, m):
         if m <= 0:
@@ -3847,8 +3913,9 @@ class MainWindow(FluentWindow):
 
     def _badd(self, sz_str, pa):
         t=self.pg_big.tbl; r=t.rowCount(); t.setRowCount(r+1); t.setItem(r, 0, make_check_item(False)); t.setItem(r, 1, QTableWidgetItem(os.path.basename(pa) if pa else ""))
-        s=QTableWidgetItem(human_size(int(sz_str))); s.setTextAlignment(Qt.AlignmentFlag.AlignRight|Qt.AlignmentFlag.AlignVCenter)
+        s=SizeTableWidgetItem(human_size(int(sz_str))); s.setData(Qt.ItemDataRole.UserRole, int(sz_str)); s.setTextAlignment(Qt.AlignmentFlag.AlignRight|Qt.AlignmentFlag.AlignVCenter)
         t.setItem(r, 2, s); t.setItem(r, 3, QTableWidgetItem(pa))
+        self.pg_big._apply_sort()
 
     def _madd(self, chk, tp, nm, det, pa):
         t=self.pg_more.tbl; r=t.rowCount(); t.setRowCount(r+1)
