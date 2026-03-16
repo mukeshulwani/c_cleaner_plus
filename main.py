@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-C盘强力清理工具 v0.3.2-alpha01
+C盘强力清理工具 v0.3.2-alpha02
 PySide6 + PySide6-Fluent-Widgets (Fluent2 UI)
 包含：常规清理(支持拖拽排序与自定义规则)、大文件扫描、重复文件、空文件夹、无效快捷方式
 """
@@ -35,20 +35,51 @@ from qfluentwidgets import (
 # ══════════════════════════════════════════════════════════
 #  版本与更新配置
 # ══════════════════════════════════════════════════════════
-CURRENT_VERSION = "0.3.2-alpha01"
+CURRENT_VERSION = "0.3.2-alpha02"
 UPDATE_JSON_URL = "https://gitee.com/kio0/c_cleaner_plus/raw/master/update.json"
 
 from qfluentwidgets.components.widgets.table_view import TableItemDelegate
+
+SESSION_LOG_MAX_LINES = 4000
+_session_log_lines = []
+_session_log_lock = threading.Lock()
+_sampled_error_counts = {}
+_sampled_error_lock = threading.Lock()
 
 def resource_path(relative_path):
     if getattr(sys, '_MEIPASS', None): return os.path.join(sys._MEIPASS, relative_path)
     return os.path.join(os.path.dirname(os.path.abspath(__file__)), relative_path)
 
+def append_session_log_line(text):
+    line = str(text or "").rstrip()
+    if not line:
+        return
+    with _session_log_lock:
+        _session_log_lines.append(line)
+        overflow = len(_session_log_lines) - SESSION_LOG_MAX_LINES
+        if overflow > 0:
+            del _session_log_lines[:overflow]
+
+def get_session_log_text():
+    with _session_log_lock:
+        return "\n".join(_session_log_lines)
+
 def format_exception_text(e):
     return f"{type(e).__name__}: {e}"
 
 def log_background_error(context, e):
-    print(f"[{time.strftime('%H:%M:%S')}] [{context}] {format_exception_text(e)}", file=sys.stderr)
+    line = f"[{time.strftime('%H:%M:%S')}] [{context}] {format_exception_text(e)}"
+    append_session_log_line(line)
+    print(line, file=sys.stderr)
+
+def log_sampled_background_error(context, e, limit=6):
+    key = str(context or "").strip() or "后台异常"
+    with _sampled_error_lock:
+        count = _sampled_error_counts.get(key, 0)
+        _sampled_error_counts[key] = count + 1
+        should_log = count < max(1, int(limit))
+    if should_log:
+        log_background_error(key, e)
 
 def append_error_sample(errors, message, limit=8):
     if len(errors) < limit:
@@ -396,7 +427,8 @@ def estimate_rule_size(entry, stop_flag=None):
         if tp == "file":
             target = expand_env(pa)
             return safe_getsize(target) if os.path.isfile(target) else 0
-    except:
+    except Exception as e:
+        log_sampled_background_error("规则估算", e)
         return 0
     return 0
 
@@ -928,16 +960,16 @@ def _load_scan_cache():
                     "ts": raw.get("ts", 0)
                 }
             }
-    except:
-        pass
+    except Exception as e:
+        log_background_error("读取扫描缓存", e)
     return {}
 
 def _save_scan_cache(drives):
     try:
         with open(CACHE_FILE, "w", encoding="utf-8") as f:
             json.dump({"drives": drives}, f, ensure_ascii=False, indent=2)
-    except:
-        pass
+    except Exception as e:
+        log_background_error("写入扫描缓存", e)
 
 def detect_disk_type(drive_letter="C"):
     drive_letter = _normalize_drive_letter(drive_letter)
@@ -968,15 +1000,15 @@ def get_scan_threads_cached(drive_letter="C"):
         cache = drives.get(drive_letter, {})
         if time.time() - cache.get("ts", 0) < 86400:
             return cache.get("threads", 4), cache.get("dtype", "Unknown")
-    except:
-        pass
+    except Exception as e:
+        log_background_error("读取线程缓存", e)
     threads, dtype = get_scan_threads(drive_letter)
     try:
         drives = _load_scan_cache()
         drives[drive_letter] = {"threads": threads, "dtype": dtype, "ts": time.time()}
         _save_scan_cache(drives)
-    except:
-        pass
+    except Exception as e:
+        log_background_error("更新线程缓存", e)
     return threads, dtype
 
 def get_scan_threads_for_drives_cached(drives):
@@ -1137,10 +1169,12 @@ def _dir_worker(dir_queue, min_b, excl, stop_flag, results, counter, lock, resul
                         local_count += 1
                         if st.st_size >= min_b:
                             _push_bigfile_result(local_results, (st.st_size, entry.path), result_limit)
-                except: pass
+                except Exception as e:
+                    log_sampled_background_error("大文件扫描子项", e)
         finally:
             try: entries.close()
-            except: pass
+            except Exception as e:
+                log_sampled_background_error("关闭目录句柄", e, limit=3)
         if local_count or local_results:
             with lock:
                 counter[0] += local_count
@@ -1234,7 +1268,8 @@ def norm_path(text):
     p=text.split(" |",1)[0].strip().strip('"').strip("'")
     p=expand_env(p).replace("/","\\")
     try: p=os.path.normpath(p)
-    except: pass
+    except Exception as e:
+        log_sampled_background_error("规范化路径", e, limit=3)
     return p
 
 def display_path(text):
@@ -1254,7 +1289,8 @@ def open_explorer(p):
         else:
             par=os.path.dirname(p)
             subprocess.Popen(["explorer",par if par and os.path.isdir(par) else p])
-    except: pass
+    except Exception as e:
+        log_background_error("打开资源管理器", e)
 
 def make_ctx(parent, table, pos, col):
     idx=table.indexAt(pos)
@@ -2088,6 +2124,10 @@ class SettingPage(ScrollArea):
         btn_check_update.clicked.connect(self._check_update_now)
         self._style_action_control(btn_check_update, 86)
 
+        btn_export_logs = PushButton(FIF.SAVE, "导出")
+        btn_export_logs.clicked.connect(self._export_logs)
+        self._style_action_control(btn_export_logs, 86)
+
         self.lbl_config_dir = CaptionLabel("")
         self.lbl_config_dir.setTextColor(QColor(128, 128, 128))
         self.lbl_config_dir.setWordWrap(True)
@@ -2140,6 +2180,17 @@ class SettingPage(ScrollArea):
                 "当前软件的规则、状态与全局设置都会保存在这里",
                 self._make_action_box(btn_cfg_browse, btn_cfg_reset),
                 self.lbl_config_dir
+            )
+        ]))
+
+        v.addSpacing(6)
+        v.addWidget(self._make_section_label("诊断"))
+        v.addWidget(self._make_group_card([
+            self._make_setting_row(
+                FIF.SAVE,
+                "导出当前日志",
+                "导出本次运行的会话日志、各页面日志快照和后台异常记录，便于排查问题",
+                btn_export_logs
             )
         ]))
 
@@ -2357,6 +2408,18 @@ class SettingPage(ScrollArea):
             InfoBar.success("刷新成功", "软件缓存已清除并重新开始硬盘测速检测！", parent=self.main_win)
         except Exception as e:
             InfoBar.error("刷新失败", f"无法清除缓存文件: {e}", parent=self.main_win)
+
+    def _export_logs(self):
+        filename = f"cdisk_cleaner_log_{time.strftime('%Y%m%d_%H%M%S')}.txt"
+        default_dir = self.main_win.config_dir if os.path.isdir(self.main_win.config_dir) else app_root_dir()
+        path, _ = QFileDialog.getSaveFileName(self, "导出日志", os.path.join(default_dir, filename), "文本文件 (*.txt)")
+        if not path:
+            return
+        ok, msg = self.main_win.export_logs_to_path(path)
+        if ok:
+            InfoBar.success("导出成功", f"日志已导出到: {path}", parent=self.main_win)
+        else:
+            InfoBar.error("导出失败", msg, parent=self.main_win)
 
     def _reset_defaults(self):
         w = MessageBox("确认恢复", "确定要将常规清理的选项恢复至默认状态吗？\n警告：这将会清除您所有已添加的自定义规则和排序！", self.main_win)
@@ -3708,7 +3771,8 @@ class MoreCleanPage(ScrollArea):
                     continue
                 try:
                     entries = os.scandir(d)
-                except:
+                except Exception as e:
+                    log_sampled_background_error("遍历目录", e)
                     dir_queue.task_done()
                     continue
                 try:
@@ -3735,13 +3799,13 @@ class MoreCleanPage(ScrollArea):
                                         res_files.append(file_info)
                                 if file_cb:
                                     file_cb(file_info[0], file_info[1])
-                        except:
-                            pass
+                        except Exception as e:
+                            log_sampled_background_error("扫描条目", e)
                 finally:
                     try:
                         entries.close()
-                    except:
-                        pass
+                    except Exception as e:
+                        log_sampled_background_error("关闭扫描句柄", e, limit=3)
                 dir_queue.task_done()
 
         threads = []
@@ -3947,8 +4011,10 @@ class MoreCleanPage(ScrollArea):
                     with open(path, 'rb') as f:
                         m = re.search(rb'[a-zA-Z]:\\[^\x00]+', f.read())
                         if m: return m.group().decode('mbcs', 'ignore')
-                except: pass
-            except: pass
+                except Exception as e:
+                    log_sampled_background_error("解析快捷方式", e)
+            except Exception as e:
+                log_sampled_background_error("解析快捷方式", e)
             return ""
         tot = len(files); invalid_cnt = 0
         for i, (_, p) in enumerate(files):
@@ -4440,6 +4506,58 @@ class MainWindow(FluentWindow):
         if hasattr(self, "pg_clean") and self.pg_clean.import_rules_from_path(path, source_name):
             self.switchTo(self.pg_clean)
 
+    def build_export_log_text(self):
+        sections = [
+            "C盘强力清理工具 日志导出",
+            f"导出时间: {time.strftime('%Y-%m-%d %H:%M:%S')}",
+            f"软件版本: {CURRENT_VERSION}",
+            f"Python版本: {sys.version.split()[0]}",
+            f"运行路径: {display_path(sys.executable if getattr(sys, 'frozen', False) else __file__)}",
+            f"配置目录: {display_path(self.config_dir)}",
+            f"更新通道: {self.global_settings.get('update_channel', 'stable')}",
+            ""
+        ]
+
+        session_text = get_session_log_text().strip()
+        sections.append("===== 会话日志 =====")
+        sections.append(session_text if session_text else "(无)")
+        sections.append("")
+
+        page_logs = [
+            ("常规清理", getattr(self.pg_clean, "log", None)),
+            ("大文件扫描", getattr(self.pg_big, "log", None)),
+            ("应用强力卸载", getattr(self.pg_uninstall, "log", None)),
+            ("更多清理", getattr(self.pg_more, "log", None)),
+        ]
+        for title, widget in page_logs:
+            text = ""
+            try:
+                text = widget.toPlainText().strip() if widget is not None else ""
+            except Exception as e:
+                log_background_error(f"读取{title}日志控件失败", e)
+                text = ""
+            sections.append(f"===== {title} 页面日志 =====")
+            sections.append(text if text else "(无)")
+            sections.append("")
+
+        return "\n".join(sections).rstrip() + "\n"
+
+    def export_logs_to_path(self, path):
+        if not path:
+            return False, "导出路径不能为空"
+        try:
+            target = os.path.abspath(os.path.expandvars(path))
+            parent = os.path.dirname(target)
+            if parent:
+                os.makedirs(parent, exist_ok=True)
+            with open(target, "w", encoding="utf-8") as f:
+                f.write(self.build_export_log_text())
+            append_session_log_line(f"[{time.strftime('%H:%M:%S')}] [日志导出] {target}")
+            return True, ""
+        except Exception as e:
+            log_background_error("导出日志失败", e)
+            return False, format_exception_text(e)
+
     def closeEvent(self, event):
         if self.global_settings.get("auto_save", True):
             try:
@@ -4583,6 +4701,7 @@ class MainWindow(FluentWindow):
 
     def _page_log(self, page, t):
         line=f"[{self._ts()}] {t}"
+        append_session_log_line(line)
         append_capped_log(page.log, line)
         page.sl.setText(t[:80])
 
