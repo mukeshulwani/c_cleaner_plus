@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-C盘强力清理工具 v0.3.6
+C盘强力清理工具 v0.3.8-alpha01
 PySide6 + PySide6-Fluent-Widgets (Fluent2 UI)
 包含：常规清理(支持拖拽排序与自定义规则)、大文件扫描、重复文件、空文件夹、无效快捷方式等
 """
@@ -35,8 +35,9 @@ from qfluentwidgets import (
 # ══════════════════════════════════════════════════════════
 #  版本与更新配置
 # ══════════════════════════════════════════════════════════
-CURRENT_VERSION = "0.3.6"
+CURRENT_VERSION = "0.3.8-alpha01"
 UPDATE_JSON_URL = "https://gitee.com/kio0/c_cleaner_plus/raw/master/update.json"
+APP_SCHEDULED_TASK_PREFIX = "C盘强力清理工具 - "
 
 from qfluentwidgets.components.widgets.table_view import TableItemDelegate
 
@@ -124,6 +125,246 @@ def write_text_file_atomic(path, text, encoding="utf-8"):
 def write_json_file_atomic(path, payload, ensure_ascii=False, indent=2):
     text = json.dumps(payload, ensure_ascii=ensure_ascii, indent=indent)
     write_text_file_atomic(path, text, encoding="utf-8")
+
+def scheduled_preset_path(config_dir=None):
+    base_dir = os.path.abspath(os.path.expandvars(config_dir or get_runtime_config_dir()))
+    return os.path.join(base_dir, "scheduled_task_presets.json")
+
+def load_scheduled_task_presets(config_dir=None):
+    path = scheduled_preset_path(config_dir)
+    try:
+        if not os.path.exists(path):
+            return {}
+        with open(path, "r", encoding="utf-8") as f:
+            payload = json.load(f)
+        return payload if isinstance(payload, dict) else {}
+    except Exception as e:
+        log_background_error("读取定时任务预设失败", e)
+        return {}
+
+def save_scheduled_task_presets(presets, config_dir=None):
+    path = scheduled_preset_path(config_dir)
+    try:
+        write_json_file_atomic(path, presets if isinstance(presets, dict) else {}, ensure_ascii=False, indent=2)
+        return True
+    except Exception as e:
+        log_background_error("保存定时任务预设失败", e)
+        return False
+
+def get_scheduled_task_preset(task_name, config_dir=None):
+    full_name = _normalize_task_name(task_name)
+    presets = load_scheduled_task_presets(config_dir)
+    preset = presets.get(full_name)
+    return preset if isinstance(preset, dict) else {}
+
+def set_scheduled_task_preset(task_name, preset, config_dir=None):
+    full_name = _normalize_task_name(task_name)
+    presets = load_scheduled_task_presets(config_dir)
+    if preset:
+        presets[full_name] = preset
+    else:
+        presets.pop(full_name, None)
+    return save_scheduled_task_presets(presets, config_dir)
+
+def delete_scheduled_task_preset(task_name, config_dir=None):
+    full_name = _normalize_task_name(task_name)
+    presets = load_scheduled_task_presets(config_dir)
+    if full_name in presets:
+        presets.pop(full_name, None)
+        return save_scheduled_task_presets(presets, config_dir)
+    return True
+
+def _normalize_task_name(name):
+    text = str(name or "").strip() or "自动常规清理"
+    if text.startswith(APP_SCHEDULED_TASK_PREFIX):
+        return text
+    return APP_SCHEDULED_TASK_PREFIX + text
+
+def _validate_schedule_time(time_text):
+    text = str(time_text or "").strip()
+    m = re.fullmatch(r"(\d{1,2}):(\d{2})", text)
+    if not m:
+        return ""
+    hour = int(m.group(1))
+    minute = int(m.group(2))
+    if not (0 <= hour <= 23 and 0 <= minute <= 59):
+        return ""
+    return f"{hour:02d}:{minute:02d}"
+
+def _get_background_python():
+    exe = os.path.abspath(sys.executable)
+    if getattr(sys, "frozen", False):
+        return exe
+    base = os.path.basename(exe).lower()
+    if base == "python.exe":
+        pyw = os.path.join(os.path.dirname(exe), "pythonw.exe")
+        if os.path.exists(pyw):
+            return pyw
+    return exe
+
+def build_scheduled_clean_command(permanent_delete=True, features=None, task_name=""):
+    if getattr(sys, "frozen", False):
+        args = [os.path.abspath(sys.executable), "--scheduled-clean"]
+    else:
+        args = [_get_background_python(), os.path.abspath(__file__), "--scheduled-clean"]
+    if task_name:
+        args.extend(["--scheduled-task-name", _normalize_task_name(task_name)])
+    if not permanent_delete:
+        args.append("--scheduled-recycle")
+    if features:
+        for f in sorted(features):
+            args.append(f"--feature-{f}")
+    return subprocess.list2cmdline(args)
+
+def _weekday_label_to_code(label):
+    mapping = {
+        "周一": "MON",
+        "周二": "TUE",
+        "周三": "WED",
+        "周四": "THU",
+        "周五": "FRI",
+        "周六": "SAT",
+        "周日": "SUN",
+    }
+    return mapping.get(str(label or "").strip(), "MON")
+
+def scheduled_log_dir(config_dir):
+    return os.path.join(config_dir, "scheduled_logs")
+
+def _run_hidden_command(args):
+    return subprocess.run(
+        args,
+        capture_output=True,
+        text=True,
+        creationflags=subprocess.CREATE_NO_WINDOW
+    )
+
+def create_scheduled_clean_task(task_name, schedule_type, time_text="", weekday_label="周一", permanent_delete=True, features=None):
+    full_name = _normalize_task_name(task_name)
+    command_text = build_scheduled_clean_command(permanent_delete=permanent_delete, features=features, task_name=full_name)
+    cmd = ["schtasks", "/Create", "/TN", full_name, "/TR", command_text, "/RL", "HIGHEST", "/F"]
+
+    schedule_key = str(schedule_type or "").strip().lower()
+    if schedule_key == "daily":
+        valid_time = _validate_schedule_time(time_text)
+        if not valid_time:
+            return False, "每日任务需要填写有效时间（HH:MM）", full_name
+        cmd.extend(["/SC", "DAILY", "/ST", valid_time])
+    elif schedule_key == "weekly":
+        valid_time = _validate_schedule_time(time_text)
+        if not valid_time:
+            return False, "每周任务需要填写有效时间（HH:MM）", full_name
+        cmd.extend(["/SC", "WEEKLY", "/D", _weekday_label_to_code(weekday_label), "/ST", valid_time])
+    elif schedule_key == "logon":
+        cmd.extend(["/SC", "ONLOGON"])
+    else:
+        return False, "不支持的任务触发方式", full_name
+
+    result = _run_hidden_command(cmd)
+    if result.returncode == 0:
+        return True, "定时任务创建成功", full_name
+    err = (result.stderr or result.stdout or "").strip() or "未知错误"
+    return False, err, full_name
+
+def delete_scheduled_app_task(task_name):
+    full_name = _normalize_task_name(task_name)
+    result = _run_hidden_command(["schtasks", "/Delete", "/TN", full_name, "/F"])
+    if result.returncode == 0:
+        return True, "定时任务已删除"
+    err = (result.stderr or result.stdout or "").strip() or "未知错误"
+    return False, err
+
+def run_scheduled_app_task(task_name):
+    full_name = _normalize_task_name(task_name)
+    result = _run_hidden_command(["schtasks", "/Run", "/TN", full_name])
+    if result.returncode == 0:
+        return True, "定时任务已触发执行"
+    err = (result.stderr or result.stdout or "").strip() or "未知错误"
+    return False, err
+
+def list_scheduled_app_tasks():
+    prefix = APP_SCHEDULED_TASK_PREFIX.replace("'", "''")
+    ps_script = f"""
+$tasks = Get-ScheduledTask -ErrorAction SilentlyContinue | Where-Object {{ $_.TaskName -like '{prefix}*' }} | ForEach-Object {{
+    $task = $_
+    $info = Get-ScheduledTaskInfo -TaskName $task.TaskName -TaskPath $task.TaskPath -ErrorAction SilentlyContinue
+    $triggers = @()
+    foreach ($trigger in @($task.Triggers)) {{
+        $cls = [string]$trigger.CimClass.CimClassName
+        $start = ''
+        try {{
+            if ($trigger.StartBoundary) {{
+                $start = ([datetime]$trigger.StartBoundary).ToString('HH:mm')
+            }}
+        }} catch {{}}
+        $days = ''
+        try {{
+            if ($trigger.DaysOfWeek) {{
+                $days = [string]$trigger.DaysOfWeek
+            }}
+        }} catch {{}}
+        $triggers += [pscustomobject]@{{
+            Class = $cls
+            Start = $start
+            Days = $days
+        }}
+    }}
+    [pscustomobject]@{{
+        Name = $task.TaskName
+        State = [string]$task.State
+        NextRunTime = if ($info -and $info.NextRunTime -and $info.NextRunTime -gt [datetime]::MinValue) {{ $info.NextRunTime.ToString('yyyy-MM-dd HH:mm') }} else {{ '' }}
+        LastRunTime = if ($info -and $info.LastRunTime -and $info.LastRunTime -gt [datetime]::MinValue) {{ $info.LastRunTime.ToString('yyyy-MM-dd HH:mm') }} else {{ '' }}
+        LastTaskResult = if ($info) {{ [int]$info.LastTaskResult }} else {{ 0 }}
+        Triggers = $triggers
+    }}
+}}
+$tasks | Sort-Object Name | ConvertTo-Json -Compress -Depth 5
+"""
+    result = subprocess.run(
+        ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", ps_script],
+        capture_output=True,
+        text=True,
+        creationflags=subprocess.CREATE_NO_WINDOW
+    )
+    if result.returncode != 0:
+        raise RuntimeError((result.stderr or result.stdout or "").strip() or "无法读取定时任务列表")
+    payload = result.stdout.strip()
+    if not payload:
+        return []
+    data = json.loads(payload)
+    if isinstance(data, dict):
+        return [data]
+    return [item for item in data if isinstance(item, dict)]
+
+def format_scheduled_trigger_text(triggers):
+    if not isinstance(triggers, list):
+        return "未知"
+    parts = []
+    day_map = {
+        "Monday": "周一",
+        "Tuesday": "周二",
+        "Wednesday": "周三",
+        "Thursday": "周四",
+        "Friday": "周五",
+        "Saturday": "周六",
+        "Sunday": "周日",
+    }
+    for trigger in triggers:
+        if not isinstance(trigger, dict):
+            continue
+        cls = str(trigger.get("Class", "")).strip()
+        start = str(trigger.get("Start", "")).strip()
+        days = str(trigger.get("Days", "")).strip()
+        if cls == "MSFT_TaskDailyTrigger":
+            parts.append(f"每天 {start}" if start else "每天")
+        elif cls == "MSFT_TaskWeeklyTrigger":
+            day_text = day_map.get(days, days or "每周")
+            parts.append(f"每周 {day_text} {start}".strip())
+        elif cls == "MSFT_TaskLogonTrigger":
+            parts.append("登录时")
+        else:
+            parts.append(start or cls or "未知")
+    return "、".join(part for part in parts if part) or "未知"
 
 def _normalize_version_text(version):
     if not version:
@@ -971,6 +1212,81 @@ def delete_scheduled_task(full_name, log_fn):
         log_fn(f"[删除计划任务] 异常: {full_name} -> {e}")
         return False
 
+def scan_installed_software_entries(stop_event=None):
+    software = []
+    scan_errors = []
+    error_count = 0
+    keys = [
+        (winreg.HKEY_LOCAL_MACHINE, r"SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall"),
+        (winreg.HKEY_LOCAL_MACHINE, r"SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall"),
+        (winreg.HKEY_CURRENT_USER, r"Software\Microsoft\Windows\CurrentVersion\Uninstall")
+    ]
+
+    for hkey, subkey_str in keys:
+        if stop_event is not None and stop_event.is_set():
+            break
+        try:
+            with winreg.OpenKey(hkey, subkey_str) as key:
+                for i in range(winreg.QueryInfoKey(key)[0]):
+                    if stop_event is not None and stop_event.is_set():
+                        break
+                    try:
+                        sub_name = winreg.EnumKey(key, i)
+                        with winreg.OpenKey(key, sub_name) as sub_key:
+                            try:
+                                disp, _ = winreg.QueryValueEx(sub_key, "DisplayName")
+                                if not disp:
+                                    continue
+
+                                def get_val(name):
+                                    try:
+                                        return winreg.QueryValueEx(sub_key, name)[0]
+                                    except OSError:
+                                        return ""
+
+                                ver = get_val("DisplayVersion")
+                                pub = get_val("Publisher")
+                                cmd = get_val("UninstallString")
+                                loc = get_val("InstallLocation")
+                                d_icon = get_val("DisplayIcon")
+                                icon_path = d_icon.split(',')[0].strip(' "') if d_icon else ""
+                                inferred_loc = infer_install_location(disp, pub, loc, cmd, d_icon)
+                                reg = f"{'HKLM' if hkey == winreg.HKEY_LOCAL_MACHINE else 'HKCU'}\\{subkey_str}\\{sub_name}"
+                                meta = classify_uninstall_entry(disp, pub, inferred_loc or loc, reg)
+                                software.append({
+                                    "name": disp,
+                                    "version": ver,
+                                    "publisher": pub,
+                                    "cmd": cmd,
+                                    "location": inferred_loc or loc,
+                                    "reg": reg,
+                                    "icon_path": icon_path,
+                                    "category": meta["category"],
+                                    "is_risky": meta["is_risky"],
+                                    "risk_kind": meta["risk_kind"],
+                                    "risk_reason": meta["risk_reason"]
+                                })
+                            except Exception as e:
+                                error_count += 1
+                                append_error_sample(scan_errors, f"{subkey_str}\\{sub_name} -> {format_exception_text(e)}")
+                    except Exception as e:
+                        error_count += 1
+                        append_error_sample(scan_errors, f"{subkey_str} 第 {i + 1} 项读取失败 -> {format_exception_text(e)}")
+        except Exception as e:
+            error_count += 1
+            append_error_sample(scan_errors, f"{subkey_str} 无法打开 -> {format_exception_text(e)}")
+
+    seen = set()
+    unique = []
+    for item in software:
+        dedupe_key = (item["name"], item["publisher"], item["location"])
+        if dedupe_key not in seen:
+            seen.add(dedupe_key)
+            unique.append(item)
+
+    unique.sort(key=lambda x: (0 if x["category"] == "用户" else 1, x["name"].lower()))
+    return unique, scan_errors, error_count
+
 # ══════════════════════════════════════════════════════════
 #  类型检测 + 缓存
 # ══════════════════════════════════════════════════════════
@@ -1272,6 +1588,82 @@ def scan_big_files(roots, min_b, excl, stop, workers=4, result_limit=None, progr
         progress_cb(scanned)
     return results
 
+def _walk_files_headless(roots, excl, workers, stop_event=None, ext_filter=None, collect_files=False, collect_dirs=False):
+    """Standalone multi-threaded file/dir walker for headless (non-UI) scheduled jobs."""
+    dir_queue = queue.Queue()
+    res_files = []
+    res_dirs = []
+    lock = threading.Lock()
+    for r in roots:
+        dir_queue.put(r)
+
+    def _worker():
+        while True:
+            try:
+                d = dir_queue.get(timeout=0.05)
+            except queue.Empty:
+                continue
+            if d is _SENTINEL:
+                dir_queue.task_done()
+                break
+            if stop_event and stop_event.is_set():
+                dir_queue.task_done()
+                continue
+            try:
+                entries = os.scandir(d)
+            except Exception:
+                dir_queue.task_done()
+                continue
+            try:
+                for entry in entries:
+                    if stop_event and stop_event.is_set():
+                        break
+                    try:
+                        if entry.is_symlink():
+                            continue
+                        if entry.is_dir(follow_symlinks=False):
+                            if not should_exclude(entry.path, excl):
+                                dir_queue.put(entry.path)
+                                if collect_dirs:
+                                    with lock:
+                                        res_dirs.append(entry.path)
+                        elif entry.is_file(follow_symlinks=False):
+                            if ext_filter and not entry.name.lower().endswith(ext_filter):
+                                continue
+                            if collect_files:
+                                with lock:
+                                    res_files.append(entry.path)
+                    except Exception:
+                        pass
+            finally:
+                try:
+                    entries.close()
+                except Exception:
+                    pass
+            dir_queue.task_done()
+
+    threads = []
+    for _ in range(workers):
+        t = threading.Thread(target=_worker, daemon=True)
+        t.start()
+        threads.append(t)
+    join_done = threading.Event()
+    threading.Thread(target=lambda: (dir_queue.join(), join_done.set()), daemon=True).start()
+    sent_stop = False
+    try:
+        while not join_done.wait(0.1):
+            if stop_event and stop_event.is_set() and not sent_stop:
+                for _ in threads:
+                    dir_queue.put(_SENTINEL)
+                sent_stop = True
+    finally:
+        if not sent_stop:
+            for _ in threads:
+                dir_queue.put(_SENTINEL)
+    for t in threads:
+        t.join(timeout=1)
+    return res_files, res_dirs
+
 class Sig(QObject):
     log=Signal(str); prog=Signal(int,int); est=Signal(int, object)
     big_clr=Signal(); big_add=Signal(str,str); done=Signal(str)
@@ -1479,6 +1871,406 @@ def app_root_dir():
     if getattr(sys, "frozen", False):
         return os.path.dirname(os.path.abspath(sys.executable))
     return os.path.dirname(os.path.abspath(__file__))
+
+def get_runtime_config_dir():
+    app_dir = app_root_dir()
+    default_dir = os.path.join(app_dir, "configs")
+    locator_path = os.path.join(app_dir, "cdisk_cleaner_bootstrap.json")
+    try:
+        if os.path.exists(locator_path):
+            with open(locator_path, "r", encoding="utf-8") as f:
+                payload = json.load(f)
+            cfg_dir = str(payload.get("config_dir", "")).strip()
+            if cfg_dir:
+                return os.path.abspath(os.path.expandvars(cfg_dir))
+    except Exception as e:
+        log_background_error("读取运行时配置目录失败", e)
+    return default_dir
+
+def get_runtime_config_paths(config_dir=None):
+    target_dir = os.path.abspath(os.path.expandvars(config_dir or get_runtime_config_dir()))
+    return {
+        "config_dir": target_dir,
+        "global": os.path.join(target_dir, "cdisk_cleaner_global_settings.json"),
+        "custom": os.path.join(target_dir, "cdisk_cleaner_custom_rules.json"),
+        "config": os.path.join(target_dir, "cdisk_cleaner_config.json")
+    }
+
+def load_runtime_targets_and_settings():
+    paths = get_runtime_config_paths()
+    global_settings = {
+        "auto_save": True,
+        "update_channel": "stable",
+        "protect_builtin_rules": True,
+        "deleted_builtin_rules": []
+    }
+    if os.path.exists(paths["global"]):
+        try:
+            with open(paths["global"], "r", encoding="utf-8") as f:
+                payload = json.load(f)
+            if isinstance(payload, dict):
+                global_settings.update(payload)
+        except Exception as e:
+            log_background_error("读取运行时全局设置失败", e)
+
+    targets = [parse_rule_entry(t) for t in default_clean_targets()]
+    targets = [t for t in targets if t]
+    deleted_builtin_rule_keys = load_rule_keys(global_settings.get("deleted_builtin_rules", []))
+    if deleted_builtin_rule_keys:
+        targets = [t for t in targets if make_rule_key(t[0], t[1], t[2], t[6]) not in deleted_builtin_rule_keys]
+
+    if os.path.exists(paths["custom"]):
+        try:
+            with open(paths["custom"], "r", encoding="utf-8") as f:
+                customs = json.load(f)
+            for item in customs:
+                parsed = parse_rule_entry(item, force_custom=True)
+                if parsed:
+                    targets.append(parsed)
+        except Exception as e:
+            log_background_error("读取运行时自定义规则失败", e)
+
+    if os.path.exists(paths["config"]):
+        try:
+            with open(paths["config"], "r", encoding="utf-8") as f:
+                saved_state = json.load(f)
+            if "order" in saved_state and "states" in saved_state:
+                order = saved_state["order"]
+                states = saved_state["states"]
+            else:
+                order = []
+                states = saved_state
+
+            if order:
+                target_map = {t[0]: t for t in targets}
+                reordered = []
+                for name in order:
+                    if name in target_map:
+                        reordered.append(target_map[name])
+                        del target_map[name]
+                reordered.extend(target_map.values())
+                targets = reordered
+
+            if isinstance(states, dict):
+                for i in range(len(targets)):
+                    nm, pa, tp, en, nt, is_c, pattern = targets[i]
+                    if nm in states:
+                        targets[i] = (nm, pa, tp, bool(states[nm]), nt, is_c, pattern)
+        except Exception as e:
+            log_background_error("读取运行时勾选状态失败", e)
+
+    return paths["config_dir"], global_settings, targets
+
+def _run_scheduled_clean(targets, permanent_delete, log):
+    """Execute regular cleaning rules (常规清理)."""
+    import fnmatch
+    selected = [parse_rule_entry(t) for t in targets if t[3]]
+    selected = [t for t in selected if t]
+    if not selected:
+        log("[常规清理] 当前没有已勾选的常规清理规则，跳过")
+        return
+    ok = fl = 0
+    for nm, pa, tp, _, nt, _, pattern in selected:
+        path_text = expand_env(pa)
+        log(f"[常规清理] 开始处理: {nm}")
+        try:
+            if tp == "dir":
+                try:
+                    entries = os.listdir(path_text)
+                except OSError:
+                    entries = []
+                for name in entries:
+                    if delete_path(os.path.join(path_text, name), permanent_delete, log):
+                        ok += 1
+                    else:
+                        fl += 1
+            elif tp == "glob":
+                rule_pattern = normalize_rule_pattern(tp, pattern, nt)
+                try:
+                    entries = os.listdir(path_text)
+                except OSError:
+                    entries = []
+                for name in entries:
+                    if fnmatch.fnmatch(name.lower(), rule_pattern.lower()):
+                        if delete_path(os.path.join(path_text, name), permanent_delete, log):
+                            ok += 1
+                        else:
+                            fl += 1
+            elif tp == "file" and os.path.exists(path_text):
+                if delete_path(path_text, permanent_delete, log):
+                    ok += 1
+                else:
+                    fl += 1
+        except Exception as e:
+            fl += 1
+            log(f"[常规清理] 规则执行失败: {nm} -> {format_exception_text(e)}")
+    log(f"[常规清理] 完成：成功 {ok}，失败 {fl}")
+
+
+def _run_scheduled_empty_dirs(permanent_delete, log):
+    """Scan and delete empty folders across all drives (空文件夹清理)."""
+    log("[空文件夹清理] 开始扫描...")
+    roots = get_available_drives()
+    _, dirs = _walk_files_headless(roots, DEFAULT_EXCLUDES, workers=4, collect_dirs=True)
+    dirs.sort(key=len, reverse=True)
+    empty_set = set()
+    for d in dirs:
+        try:
+            is_empty = True
+            for item in os.scandir(d):
+                if item.is_file(follow_symlinks=False):
+                    is_empty = False
+                    break
+                elif item.is_dir(follow_symlinks=False) and item.path not in empty_set:
+                    is_empty = False
+                    break
+            if is_empty:
+                empty_set.add(d)
+        except Exception:
+            pass
+    if not empty_set:
+        log("[空文件夹清理] 未发现空文件夹")
+        return
+    log(f"[空文件夹清理] 发现 {len(empty_set)} 个空文件夹，开始清理")
+    ok = fl = 0
+    for d in empty_set:
+        if delete_path(d, permanent_delete, log):
+            ok += 1
+        else:
+            fl += 1
+    log(f"[空文件夹清理] 完成：成功 {ok}，失败 {fl}")
+
+
+def _run_scheduled_shortcuts(permanent_delete, log):
+    """Scan and delete broken shortcuts across all drives (无效快捷方式清理)."""
+    log("[无效快捷方式] 开始扫描...")
+    roots = get_available_drives()
+    files, _ = _walk_files_headless(roots, DEFAULT_EXCLUDES, workers=4, ext_filter=".lnk", collect_files=True)
+
+    def _resolve_lnk_target(path):
+        try:
+            import win32com.client
+            return win32com.client.Dispatch("WScript.Shell").CreateShortCut(path).TargetPath
+        except ImportError:
+            try:
+                with open(path, 'rb') as f:
+                    m = re.search(rb'[a-zA-Z]:\\[^\x00]+', f.read())
+                    if m:
+                        return m.group().decode('mbcs', 'ignore')
+            except Exception:
+                pass
+        except Exception:
+            pass
+        return ""
+
+    invalid = []
+    for p in files:
+        target = _resolve_lnk_target(p)
+        if target and not os.path.exists(target):
+            invalid.append(p)
+
+    if not invalid:
+        log("[无效快捷方式] 未发现无效快捷方式")
+        return
+    log(f"[无效快捷方式] 发现 {len(invalid)} 个无效快捷方式，开始清理")
+    ok = fl = 0
+    for p in invalid:
+        if delete_path(p, permanent_delete, log):
+            ok += 1
+        else:
+            fl += 1
+    log(f"[无效快捷方式] 完成：成功 {ok}，失败 {fl}")
+
+def _run_scheduled_registry_cleanup(log):
+    log("[卸载注册表清理] 开始扫描...")
+    keys_to_check = [
+        (winreg.HKEY_LOCAL_MACHINE, r"SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall"),
+        (winreg.HKEY_LOCAL_MACHINE, r"SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall"),
+        (winreg.HKEY_CURRENT_USER, r"Software\Microsoft\Windows\CurrentVersion\Uninstall")
+    ]
+    invalid_paths = []
+    scan_errors = []
+    error_count = 0
+
+    for hkey, subkey_str in keys_to_check:
+        try:
+            with winreg.OpenKey(hkey, subkey_str) as key:
+                for i in range(winreg.QueryInfoKey(key)[0]):
+                    try:
+                        sub_name = winreg.EnumKey(key, i)
+                        with winreg.OpenKey(key, sub_name) as sub_key:
+                            try:
+                                install_loc, _ = winreg.QueryValueEx(sub_key, "InstallLocation")
+                            except OSError:
+                                install_loc = ""
+                            if install_loc and not os.path.exists(install_loc):
+                                invalid_paths.append(
+                                    f"{'HKLM' if hkey == winreg.HKEY_LOCAL_MACHINE else 'HKCU'}\\{subkey_str}\\{sub_name}"
+                                )
+                    except OSError as e:
+                        error_count += 1
+                        append_error_sample(scan_errors, f"{subkey_str} 第 {i + 1} 项读取失败 -> {format_exception_text(e)}")
+        except OSError as e:
+            error_count += 1
+            append_error_sample(scan_errors, f"{subkey_str} 无法打开 -> {format_exception_text(e)}")
+
+    if error_count:
+        emit_error_summary(log, "卸载注册表扫描异常", scan_errors, error_count)
+
+    if not invalid_paths:
+        log("[卸载注册表清理] 未发现无效卸载注册表项")
+        return
+
+    log(f"[卸载注册表清理] 发现 {len(invalid_paths)} 个无效卸载注册表项，开始清理")
+    ok = fl = 0
+    for reg_path in invalid_paths:
+        if force_delete_registry(reg_path, log):
+            ok += 1
+        else:
+            fl += 1
+    log(f"[卸载注册表清理] 完成：成功 {ok}，失败 {fl}")
+
+def _verify_uninstall_result_messages(app_name, install_dir, reg_path):
+    messages = []
+    path_text = norm_path(install_dir)
+    if path_text and os.path.exists(path_text):
+        messages.append(f"[卸载校验] {app_name} 安装目录仍存在: {path_text}")
+    if reg_path:
+        hive_name, _, subkey = reg_path.partition("\\")
+        hive_map = {
+            "HKLM": winreg.HKEY_LOCAL_MACHINE,
+            "HKCU": winreg.HKEY_CURRENT_USER,
+            "HKCR": winreg.HKEY_CLASSES_ROOT
+        }
+        hkey = hive_map.get(hive_name)
+        if hkey and subkey:
+            try:
+                with winreg.OpenKey(hkey, subkey):
+                    messages.append(f"[卸载校验] {app_name} 卸载注册表项仍存在")
+            except OSError:
+                pass
+    if not messages:
+        messages.append(f"[卸载校验] {app_name} 主要卸载痕迹已移除")
+    return messages
+
+def _run_scheduled_standard_uninstall(config_dir, task_name, log):
+    preset = get_scheduled_task_preset(task_name, config_dir)
+    uninstall_cfg = preset.get("uninstall_std", {}) if isinstance(preset, dict) else {}
+    items = uninstall_cfg.get("items", []) if isinstance(uninstall_cfg, dict) else []
+    if not items:
+        log("[应用标准卸载] 当前任务未配置待卸载应用，跳过")
+        return
+
+    prefer_silent = bool(uninstall_cfg.get("prefer_silent", False))
+    timeout_sec = max(30, int(uninstall_cfg.get("timeout_sec", 1200) or 1200))
+
+    installed, scan_errors, error_count = scan_installed_software_entries()
+    if error_count:
+        emit_error_summary(log, "应用扫描异常", scan_errors, error_count)
+
+    installed_by_reg = {}
+    for item in installed:
+        reg_path = str(item.get("reg", "")).strip()
+        if reg_path:
+            installed_by_reg[reg_path.lower()] = item
+
+    ok = fl = sk = 0
+    for raw_item in items:
+        if not isinstance(raw_item, dict):
+            continue
+        reg_path = str(raw_item.get("reg", "")).strip()
+        app_name = str(raw_item.get("name", "")).strip() or reg_path or "未知应用"
+        current = installed_by_reg.get(reg_path.lower()) if reg_path else None
+        if not current:
+            sk += 1
+            log(f"[应用标准卸载] 跳过 {app_name}：当前未在卸载列表中找到")
+            continue
+        if current.get("risk_kind") in {"critical", "system"}:
+            sk += 1
+            log(f"[应用标准卸载] 跳过 {current['name']}：属于高风险/系统组件，不支持定时自动卸载")
+            continue
+        cmd = current.get("cmd", "")
+        if not cmd:
+            sk += 1
+            log(f"[应用标准卸载] 跳过 {current['name']}：未提供卸载命令")
+            continue
+
+        run_cmd, mode_text = build_uninstall_command(cmd, prefer_silent=prefer_silent)
+        log(f"[应用标准卸载] 正在调用{mode_text}卸载: {current['name']}")
+        try:
+            proc = subprocess.Popen(
+                ["cmd", "/c", run_cmd],
+                creationflags=subprocess.CREATE_NO_WINDOW
+            )
+            try:
+                proc.wait(timeout=timeout_sec)
+            except subprocess.TimeoutExpired:
+                terminate_process_tree(proc.pid)
+                fl += 1
+                log(f"[应用标准卸载] 超时已终止: {current['name']}（超过 {timeout_sec // 60} 分钟）")
+                continue
+
+            if proc.returncode not in (0, None):
+                fl += 1
+                log(f"[应用标准卸载] 返回码异常: {current['name']} -> {proc.returncode}")
+                continue
+
+            ok += 1
+            for msg in _verify_uninstall_result_messages(current["name"], current.get("location", ""), current.get("reg", "")):
+                log(msg)
+        except Exception as e:
+            fl += 1
+            log(f"[应用标准卸载] 启动失败: {current['name']} -> {format_exception_text(e)}")
+
+    log(f"[应用标准卸载] 完成：成功 {ok}，失败 {fl}，跳过 {sk}")
+
+
+SCHEDULED_FEATURE_LABELS = {
+    "clean": "常规清理",
+    "empty_dirs": "空文件夹清理",
+    "shortcuts": "无效快捷方式清理",
+    "registry_cleanup": "卸载注册表清理",
+    "uninstall_std": "应用标准卸载",
+}
+
+
+def run_scheduled_job(permanent_delete=True, features=None, task_name=""):
+    if features is None:
+        features = {"clean"}
+    started_at = time.time()
+    config_dir, _, targets = load_runtime_targets_and_settings()
+    log_lines = []
+
+    def log(message):
+        line = f"[{time.strftime('%H:%M:%S')}] {message}"
+        log_lines.append(line)
+
+    feat_names = ", ".join(SCHEDULED_FEATURE_LABELS.get(f, f) for f in sorted(features))
+    log(f"[定时任务] 开始执行，功能: {feat_names}")
+
+    if "clean" in features:
+        _run_scheduled_clean(targets, permanent_delete, log)
+    if "empty_dirs" in features:
+        _run_scheduled_empty_dirs(permanent_delete, log)
+    if "shortcuts" in features:
+        _run_scheduled_shortcuts(permanent_delete, log)
+    if "registry_cleanup" in features:
+        _run_scheduled_registry_cleanup(log)
+    if "uninstall_std" in features:
+        _run_scheduled_standard_uninstall(config_dir, task_name, log)
+
+    log(f"[定时任务] 全部结束，耗时 {time.time()-started_at:.1f} 秒")
+
+    log_path = os.path.join(
+        scheduled_log_dir(config_dir),
+        f"scheduled_clean_{time.strftime('%Y%m%d_%H%M%S')}.log"
+    )
+    try:
+        write_text_file_atomic(log_path, "\n".join(log_lines).rstrip() + "\n", encoding="utf-8")
+    except Exception as e:
+        log_background_error("写入定时清理日志失败", e)
+        return 1
+    return 0
 
 SYSTEM_SOFTWARE_NAME_KEYWORDS = (
     "microsoft windows", "windows update", "update for microsoft windows", "security update",
@@ -2205,6 +2997,451 @@ class RuleStorePage(ScrollArea):
             InfoBar.error("导入失败", str(e), parent=self.main_win)
             return
         self.main_win.import_rules_from_path(path, title_text)
+
+class ScheduledUninstallDialog(MessageBoxBase):
+    def __init__(self, selected_regs=None, parent=None):
+        super().__init__(parent)
+        self.selected_regs = {str(x or "").strip().lower() for x in (selected_regs or []) if str(x or "").strip()}
+        self.setWindowTitle("选择定时卸载应用")
+        self.widget.setMinimumWidth(900)
+        self.widget.setMinimumHeight(560)
+
+        title = TitleLabel("选择定时卸载应用")
+        setFont(title, 16, QFont.Weight.Bold)
+        self.viewLayout.addWidget(title)
+        self.viewLayout.addSpacing(8)
+
+        desc = CaptionLabel("定时任务只支持对普通用户软件执行标准卸载。系统组件和极高风险软件会被跳过。")
+        desc.setWordWrap(True)
+        desc.setTextColor(QColor(128, 128, 128))
+        self.viewLayout.addWidget(desc)
+
+        top = QHBoxLayout()
+        top.setSpacing(10)
+        self.search_input = SearchLineEdit()
+        self.search_input.setPlaceholderText("搜索软件名称或发布者...")
+        self.search_input.textChanged.connect(self._filter_table)
+        top.addWidget(self.search_input, 1)
+        btn_refresh = PushButton(FIF.SYNC, "刷新列表")
+        btn_refresh.clicked.connect(self._load_items)
+        top.addWidget(btn_refresh)
+        self.viewLayout.addLayout(top)
+
+        self.tbl = TableWidget()
+        self.tbl.setColumnCount(5)
+        self.tbl.setHorizontalHeaderLabels([" ", "分类", "名称", "版本", "发布者"])
+        self.tbl.verticalHeader().setVisible(False)
+        self.tbl.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+        self.tbl.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
+        self.tbl.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        self.tbl.setColumnWidth(0, 36)
+        self.tbl.setColumnWidth(1, 70)
+        self.tbl.setColumnWidth(2, 320)
+        self.tbl.setColumnWidth(3, 110)
+        self.tbl.horizontalHeader().setStretchLastSection(True)
+        style_table(self.tbl)
+        self.viewLayout.addWidget(self.tbl, 1)
+
+        self.log = CaptionLabel("")
+        self.log.setWordWrap(True)
+        self.log.setTextColor(QColor(128, 128, 128))
+        self.viewLayout.addWidget(self.log)
+
+        self.yesButton.setText("保存选择")
+        self.cancelButton.setText("取消")
+        self._items = []
+        self._load_items()
+
+    def _set_log(self, text):
+        self.log.setText(text or "")
+
+    def _filter_table(self, text):
+        search_str = str(text or "").lower()
+        for row in range(self.tbl.rowCount()):
+            name_item = self.tbl.item(row, 2)
+            pub_item = self.tbl.item(row, 4)
+            name = name_item.text().lower() if name_item else ""
+            publisher = pub_item.text().lower() if pub_item else ""
+            match = not search_str or search_str in name or search_str in publisher
+            self.tbl.setRowHidden(row, not match)
+
+    def _load_items(self):
+        try:
+            items, scan_errors, error_count = scan_installed_software_entries()
+        except Exception as e:
+            self._items = []
+            self.tbl.setRowCount(0)
+            self._set_log(f"读取应用列表失败: {e}")
+            return
+
+        self._items = items
+        self.tbl.setRowCount(len(items))
+        blocked_count = 0
+        for row, item in enumerate(items):
+            reg_key = str(item.get("reg", "")).strip().lower()
+            risk_kind = str(item.get("risk_kind", "")).strip()
+            blocked = risk_kind in {"critical", "system"}
+            if blocked:
+                blocked_count += 1
+            check_item = make_check_item(reg_key in self.selected_regs and not blocked)
+            if blocked:
+                check_item.setFlags(Qt.ItemFlag.ItemIsEnabled)
+            self.tbl.setItem(row, 0, check_item)
+
+            category_item = QTableWidgetItem(item.get("category", "用户"))
+            if blocked:
+                category_item.setForeground(QColor(196, 92, 32))
+                category_item.setToolTip(item.get("risk_reason", "") or "系统组件/极高风险组件，定时任务会自动跳过")
+            self.tbl.setItem(row, 1, category_item)
+
+            name_item = QTableWidgetItem(item.get("name", ""))
+            name_item.setData(Qt.ItemDataRole.UserRole, item)
+            if blocked:
+                name_item.setToolTip(item.get("risk_reason", "") or "系统组件/极高风险组件，定时任务会自动跳过")
+            self.tbl.setItem(row, 2, name_item)
+            self.tbl.setItem(row, 3, QTableWidgetItem(item.get("version", "")))
+            self.tbl.setItem(row, 4, QTableWidgetItem(item.get("publisher", "")))
+
+        summary = f"已加载 {len(items)} 个应用"
+        if blocked_count:
+            summary += f"，其中 {blocked_count} 个系统/极高风险项目不可选"
+        if error_count:
+            summary += f"，另有 {error_count} 条扫描异常"
+        self._set_log(summary)
+        self._filter_table(self.search_input.text())
+
+    def selected_items(self):
+        rows = []
+        for row in range(self.tbl.rowCount()):
+            if is_row_checked(self.tbl, row):
+                item = self.tbl.item(row, 2)
+                data = item.data(Qt.ItemDataRole.UserRole) if item else None
+                if isinstance(data, dict):
+                    rows.append({
+                        "name": data.get("name", ""),
+                        "publisher": data.get("publisher", ""),
+                        "reg": data.get("reg", ""),
+                        "location": data.get("location", ""),
+                        "cmd": data.get("cmd", "")
+                    })
+        return rows
+
+class SchedulePage(ScrollArea):
+    def __init__(self, main_win, parent=None):
+        super().__init__(parent)
+        self.main_win = main_win
+        self.uninstall_items = []
+        self.view = QWidget()
+        self.setWidget(self.view)
+        self.setWidgetResizable(True)
+        self.setObjectName("schedulePage")
+        self.enableTransparentBackground()
+
+        root = QVBoxLayout(self.view)
+        root.setContentsMargins(28, 12, 28, 20)
+        root.setSpacing(10)
+        root.addLayout(make_title_row(FIF.SYNC, "定时任务"))
+
+        desc = CaptionLabel("创建 Windows 定时任务，按每天、每周或登录时自动执行选定的清理功能")
+        desc.setWordWrap(True)
+        desc.setTextColor(QColor(128, 128, 128))
+        root.addWidget(desc)
+
+        form = CardWidget(self.view)
+        form_layout = QVBoxLayout(form)
+        form_layout.setContentsMargins(16, 16, 16, 16)
+        form_layout.setSpacing(10)
+
+        row1 = QHBoxLayout()
+        row1.setSpacing(10)
+        row1.addWidget(StrongBodyLabel("任务名称:"))
+        self.name_input = LineEdit()
+        self.name_input.setPlaceholderText("例如：每日自动清理")
+        self.name_input.setText("每日自动清理")
+        row1.addWidget(self.name_input, 1)
+        row1.addWidget(StrongBodyLabel("触发方式:"))
+        self.cb_schedule = ComboBox()
+        self.cb_schedule.addItems(["每天", "每周", "登录时"])
+        self.cb_schedule.currentIndexChanged.connect(self._sync_trigger_widgets)
+        row1.addWidget(self.cb_schedule)
+        form_layout.addLayout(row1)
+
+        row2 = QHBoxLayout()
+        row2.setSpacing(10)
+        self.lbl_time = StrongBodyLabel("执行时间:")
+        row2.addWidget(self.lbl_time)
+        self.time_input = LineEdit()
+        self.time_input.setPlaceholderText("HH:MM")
+        self.time_input.setText("03:00")
+        self.time_input.setFixedWidth(120)
+        row2.addWidget(self.time_input)
+        self.lbl_weekday = StrongBodyLabel("星期:")
+        row2.addWidget(self.lbl_weekday)
+        self.cb_weekday = ComboBox()
+        self.cb_weekday.addItems(["周一", "周二", "周三", "周四", "周五", "周六", "周日"])
+        self.cb_weekday.setFixedWidth(110)
+        row2.addWidget(self.cb_weekday)
+        self.chk_permanent = CheckBox("强力模式：永久删除")
+        self.chk_permanent.setChecked(True)
+        row2.addWidget(self.chk_permanent)
+        row2.addStretch()
+        form_layout.addLayout(row2)
+
+        row_feat = QHBoxLayout()
+        row_feat.setSpacing(10)
+        row_feat.addWidget(StrongBodyLabel("执行功能:"))
+        self.chk_feat_clean = CheckBox("常规清理")
+        self.chk_feat_clean.setChecked(True)
+        self.chk_feat_clean.setToolTip("执行当前已勾选的常规清理规则")
+        row_feat.addWidget(self.chk_feat_clean)
+        self.chk_feat_empty_dirs = CheckBox("空文件夹清理")
+        self.chk_feat_empty_dirs.setToolTip("扫描所有磁盘并删除空文件夹")
+        row_feat.addWidget(self.chk_feat_empty_dirs)
+        self.chk_feat_shortcuts = CheckBox("无效快捷方式清理")
+        self.chk_feat_shortcuts.setToolTip("扫描所有磁盘并删除指向缺失目标的快捷方式")
+        row_feat.addWidget(self.chk_feat_shortcuts)
+        self.chk_feat_registry = CheckBox("卸载注册表清理")
+        self.chk_feat_registry.setToolTip("自动清理安装目录已丢失的卸载注册表项")
+        row_feat.addWidget(self.chk_feat_registry)
+        self.chk_feat_uninstall_std = CheckBox("应用标准卸载")
+        self.chk_feat_uninstall_std.setToolTip("按任务预设的应用列表执行标准卸载，系统/高危组件会自动跳过")
+        self.chk_feat_uninstall_std.toggled.connect(self._sync_uninstall_widgets)
+        row_feat.addWidget(self.chk_feat_uninstall_std)
+        row_feat.addStretch()
+        form_layout.addLayout(row_feat)
+
+        self.uninstall_cfg_widget = QWidget()
+        row_uninstall = QHBoxLayout(self.uninstall_cfg_widget)
+        row_uninstall.setContentsMargins(0, 0, 0, 0)
+        row_uninstall.setSpacing(8)
+        row_uninstall.addWidget(StrongBodyLabel("卸载预设:"))
+        self.lbl_uninstall_summary = CaptionLabel("未配置应用卸载任务")
+        self.lbl_uninstall_summary.setTextColor(QColor(128, 128, 128))
+        row_uninstall.addWidget(self.lbl_uninstall_summary)
+        self.btn_pick_uninstall = PushButton(FIF.APPLICATION, "选择应用")
+        self.btn_pick_uninstall.clicked.connect(self._pick_uninstall_items)
+        row_uninstall.addWidget(self.btn_pick_uninstall)
+        row_uninstall.addSpacing(12)
+        self.chk_uninstall_silent = CheckBox("优先静默卸载")
+        row_uninstall.addWidget(self.chk_uninstall_silent)
+        timeout_label = CaptionLabel("超时")
+        timeout_label.setTextColor(QColor(128, 128, 128))
+        row_uninstall.addWidget(timeout_label)
+        self.sp_uninstall_timeout = SpinBox()
+        self.sp_uninstall_timeout.setRange(1, 120)
+        self.sp_uninstall_timeout.setValue(20)
+        self.sp_uninstall_timeout.setFixedWidth(110)
+        row_uninstall.addWidget(self.sp_uninstall_timeout)
+        row_uninstall.addWidget(CaptionLabel("分钟"))
+        row_uninstall.addStretch(1)
+        form_layout.addWidget(self.uninstall_cfg_widget)
+
+        row3 = QHBoxLayout()
+        row3.setSpacing(8)
+        btn_create = PrimaryPushButton(FIF.ADD, "创建/覆盖任务")
+        btn_create.clicked.connect(self._create_task)
+        row3.addWidget(btn_create)
+        btn_refresh = PushButton(FIF.SYNC, "刷新列表")
+        btn_refresh.clicked.connect(self.refresh_tasks)
+        row3.addWidget(btn_refresh)
+        btn_run = PushButton(FIF.ACCEPT, "立即执行")
+        btn_run.clicked.connect(self._run_selected_task)
+        row3.addWidget(btn_run)
+        btn_delete = PushButton(FIF.DELETE, "删除选中")
+        btn_delete.clicked.connect(self._delete_selected_task)
+        row3.addWidget(btn_delete)
+        btn_open_logs = PushButton(FIF.FOLDER, "打开日志目录")
+        btn_open_logs.clicked.connect(self._open_log_dir)
+        row3.addWidget(btn_open_logs)
+        row3.addStretch()
+        form_layout.addLayout(row3)
+        root.addWidget(form)
+
+        self.tbl = TableWidget()
+        self.tbl.setColumnCount(6)
+        self.tbl.setHorizontalHeaderLabels(["任务名称", "触发方式", "下次运行", "上次运行", "状态", "结果"])
+        self.tbl.verticalHeader().setVisible(False)
+        self.tbl.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+        self.tbl.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
+        self.tbl.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        self.tbl.setColumnWidth(0, 220)
+        self.tbl.setColumnWidth(1, 180)
+        self.tbl.setColumnWidth(2, 150)
+        self.tbl.setColumnWidth(3, 150)
+        self.tbl.setColumnWidth(4, 90)
+        self.tbl.horizontalHeader().setStretchLastSection(True)
+        style_table(self.tbl)
+        root.addWidget(self.tbl, 1)
+
+        self.log = TextEdit()
+        self.log.setReadOnly(True)
+        self.log.setMaximumHeight(120)
+        self.log.setFont(QFont("Consolas", 9))
+        self.log.setPlaceholderText("日志...")
+        root.addWidget(self.log)
+
+        self._sync_trigger_widgets()
+        self._sync_uninstall_widgets()
+        self.refresh_tasks()
+
+    def _append_log(self, text):
+        line = f"[{time.strftime('%H:%M:%S')}] {text}"
+        append_session_log_line(line)
+        append_capped_log(self.log, line)
+
+    def _sync_trigger_widgets(self):
+        is_weekly = self.cb_schedule.currentIndex() == 1
+        is_logon = self.cb_schedule.currentIndex() == 2
+        self.lbl_time.setVisible(not is_logon)
+        self.time_input.setVisible(not is_logon)
+        self.lbl_weekday.setVisible(is_weekly)
+        self.cb_weekday.setVisible(is_weekly)
+
+    def _sync_uninstall_widgets(self):
+        enabled = self.chk_feat_uninstall_std.isChecked()
+        self.uninstall_cfg_widget.setVisible(enabled)
+        self.btn_pick_uninstall.setEnabled(enabled)
+        self.chk_uninstall_silent.setEnabled(enabled)
+        self.sp_uninstall_timeout.setEnabled(enabled)
+        if not enabled:
+            self.lbl_uninstall_summary.setText("未启用应用标准卸载")
+        elif self.uninstall_items:
+            self.lbl_uninstall_summary.setText(f"已选择 {len(self.uninstall_items)} 个应用")
+        else:
+            self.lbl_uninstall_summary.setText("尚未选择待卸载应用")
+
+    def _pick_uninstall_items(self):
+        selected_regs = [str(item.get("reg", "")).strip() for item in self.uninstall_items if isinstance(item, dict)]
+        dialog = ScheduledUninstallDialog(selected_regs, self.main_win)
+        if not dialog.exec():
+            return
+        self.uninstall_items = dialog.selected_items()
+        self._sync_uninstall_widgets()
+        self._append_log(f"已选择 {len(self.uninstall_items)} 个应用用于定时标准卸载")
+
+    def _selected_task_name(self):
+        row = self.tbl.currentRow()
+        if row < 0:
+            return ""
+        item = self.tbl.item(row, 0)
+        if not item:
+            return ""
+        full_name = item.data(Qt.ItemDataRole.UserRole)
+        return str(full_name or item.text()).strip()
+
+    def refresh_tasks(self):
+        try:
+            items = list_scheduled_app_tasks()
+        except Exception as e:
+            self._append_log(f"刷新定时任务失败: {e}")
+            InfoBar.error("刷新失败", str(e), parent=self.main_win)
+            return
+
+        self.tbl.setRowCount(len(items))
+        for row, item in enumerate(items):
+            full_name = str(item.get("Name", "")).strip()
+            display_name = full_name[len(APP_SCHEDULED_TASK_PREFIX):] if full_name.startswith(APP_SCHEDULED_TASK_PREFIX) else full_name
+            name_item = QTableWidgetItem(display_name)
+            name_item.setData(Qt.ItemDataRole.UserRole, full_name)
+            trigger_text = format_scheduled_trigger_text(item.get("Triggers", []))
+            state_text = str(item.get("State", "")).strip() or "未知"
+            result_text = str(item.get("LastTaskResult", "0")).strip()
+            self.tbl.setItem(row, 0, name_item)
+            self.tbl.setItem(row, 1, QTableWidgetItem(trigger_text))
+            self.tbl.setItem(row, 2, QTableWidgetItem(str(item.get("NextRunTime", "")).strip()))
+            self.tbl.setItem(row, 3, QTableWidgetItem(str(item.get("LastRunTime", "")).strip()))
+            self.tbl.setItem(row, 4, QTableWidgetItem(state_text))
+            self.tbl.setItem(row, 5, QTableWidgetItem(result_text))
+
+        self._append_log(f"已加载 {len(items)} 个定时任务")
+
+    def _create_task(self):
+        raw_name = self.name_input.text().strip() or "自动常规清理"
+        schedule_index = self.cb_schedule.currentIndex()
+        schedule_type = {0: "daily", 1: "weekly", 2: "logon"}.get(schedule_index, "daily")
+        time_text = self.time_input.text().strip()
+        weekday_label = self.cb_weekday.currentText().strip()
+        features = set()
+        if self.chk_feat_clean.isChecked():
+            features.add("clean")
+        if self.chk_feat_empty_dirs.isChecked():
+            features.add("empty_dirs")
+        if self.chk_feat_shortcuts.isChecked():
+            features.add("shortcuts")
+        if self.chk_feat_registry.isChecked():
+            features.add("registry_cleanup")
+        if self.chk_feat_uninstall_std.isChecked():
+            features.add("uninstall_std")
+        if not features:
+            InfoBar.warning("提示", "请至少选择一个执行功能", parent=self.main_win)
+            return
+        if "uninstall_std" in features and not self.uninstall_items:
+            InfoBar.warning("提示", "已启用应用标准卸载，请先选择至少一个应用", parent=self.main_win)
+            return
+        ok, msg, full_name = create_scheduled_clean_task(
+            raw_name,
+            schedule_type,
+            time_text=time_text,
+            weekday_label=weekday_label,
+            permanent_delete=self.chk_permanent.isChecked(),
+            features=features,
+        )
+        if ok:
+            preset = {
+                "features": sorted(features),
+                "updated_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+            }
+            if "uninstall_std" in features:
+                preset["uninstall_std"] = {
+                    "items": list(self.uninstall_items),
+                    "prefer_silent": self.chk_uninstall_silent.isChecked(),
+                    "timeout_sec": self.sp_uninstall_timeout.value() * 60
+                }
+            else:
+                preset["uninstall_std"] = {"items": []}
+            set_scheduled_task_preset(full_name, preset, self.main_win.config_dir)
+            self._append_log(f"{full_name} 创建成功")
+            InfoBar.success("创建成功", msg, parent=self.main_win)
+            self.refresh_tasks()
+        else:
+            self._append_log(f"{full_name} 创建失败: {msg}")
+            InfoBar.error("创建失败", msg, parent=self.main_win)
+
+    def _delete_selected_task(self):
+        task_name = self._selected_task_name()
+        if not task_name:
+            InfoBar.warning("提示", "请先选择一个定时任务", parent=self.main_win)
+            return
+        if not MessageBox("确认", f"确定删除该定时任务？\n{task_name}", self.main_win).exec():
+            return
+        ok, msg = delete_scheduled_app_task(task_name)
+        if ok:
+            delete_scheduled_task_preset(task_name, self.main_win.config_dir)
+            self._append_log(f"{task_name} 已删除")
+            InfoBar.success("删除成功", msg, parent=self.main_win)
+            self.refresh_tasks()
+        else:
+            self._append_log(f"{task_name} 删除失败: {msg}")
+            InfoBar.error("删除失败", msg, parent=self.main_win)
+
+    def _run_selected_task(self):
+        task_name = self._selected_task_name()
+        if not task_name:
+            InfoBar.warning("提示", "请先选择一个定时任务", parent=self.main_win)
+            return
+        ok, msg = run_scheduled_app_task(task_name)
+        if ok:
+            self._append_log(f"{task_name} 已触发执行")
+            InfoBar.success("已执行", msg, parent=self.main_win)
+            self.refresh_tasks()
+        else:
+            self._append_log(f"{task_name} 执行失败: {msg}")
+            InfoBar.error("执行失败", msg, parent=self.main_win)
+
+    def _open_log_dir(self):
+        target = scheduled_log_dir(self.main_win.config_dir)
+        os.makedirs(target, exist_ok=True)
+        open_explorer(target)
 
 # ══════════════════════════════════════════════════════════
 #  页面：全局设置 (SettingPage)
@@ -3379,75 +4616,10 @@ class UninstallPage(ScrollArea):
 
     def _scan_w(self):
         t0 = time.time()
-        software = []
-        scan_errors = []
-        error_count = 0
-        keys = [(winreg.HKEY_LOCAL_MACHINE, r"SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall"),
-                (winreg.HKEY_LOCAL_MACHINE, r"SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall"),
-                (winreg.HKEY_CURRENT_USER, r"Software\Microsoft\Windows\CurrentVersion\Uninstall")]
-        
-        for hkey, subkey_str in keys:
-            if self.stop.is_set():
-                self.sig.uninst_done.emit(f"扫描已取消，耗时 {time.time()-t0:.1f} 秒")
-                return
-            try:
-                with winreg.OpenKey(hkey, subkey_str) as key:
-                    for i in range(winreg.QueryInfoKey(key)[0]):
-                        try:
-                            sub_name = winreg.EnumKey(key, i)
-                            with winreg.OpenKey(key, sub_name) as sub_key:
-                                try:
-                                    disp, _ = winreg.QueryValueEx(sub_key, "DisplayName")
-                                    if disp:
-                                        def get_val(name):
-                                            try: return winreg.QueryValueEx(sub_key, name)[0]
-                                            except OSError: return ""
-
-                                        ver = get_val("DisplayVersion")
-                                        pub = get_val("Publisher")
-                                        cmd = get_val("UninstallString")
-                                        loc = get_val("InstallLocation")
-
-                                        d_icon = get_val("DisplayIcon")
-                                        icon_path = ""
-                                        if d_icon:
-                                            icon_path = d_icon.split(',')[0].strip(' "')
-                                        inferred_loc = infer_install_location(disp, pub, loc, cmd, d_icon)
-
-                                        reg = f"{'HKLM' if hkey==winreg.HKEY_LOCAL_MACHINE else 'HKCU'}\\{subkey_str}\\{sub_name}"
-                                        meta = classify_uninstall_entry(disp, pub, inferred_loc or loc, reg)
-                                        software.append({
-                                            "name": disp,
-                                            "version": ver,
-                                            "publisher": pub,
-                                            "cmd": cmd,
-                                            "location": inferred_loc or loc,
-                                            "reg": reg,
-                                            "icon_path": icon_path,
-                                            "category": meta["category"],
-                                            "is_risky": meta["is_risky"],
-                                            "risk_kind": meta["risk_kind"],
-                                            "risk_reason": meta["risk_reason"]
-                                        })
-                                except Exception as e:
-                                    error_count += 1
-                                    append_error_sample(scan_errors, f"{subkey_str}\\{sub_name} -> {format_exception_text(e)}")
-                        except Exception as e:
-                            error_count += 1
-                            append_error_sample(scan_errors, f"{subkey_str} 第 {i + 1} 项读取失败 -> {format_exception_text(e)}")
-            except Exception as e:
-                error_count += 1
-                append_error_sample(scan_errors, f"{subkey_str} 无法打开 -> {format_exception_text(e)}")
-        
-        seen = set()
-        unique = []
-        for s in software:
-            dedupe_key = (s["name"], s["publisher"], s["location"])
-            if dedupe_key not in seen: 
-                seen.add(dedupe_key)
-                unique.append(s)
-
-        unique.sort(key=lambda x: (0 if x["category"] == "用户" else 1, x["name"].lower()))
+        unique, scan_errors, error_count = scan_installed_software_entries(self.stop)
+        if self.stop.is_set():
+            self.sig.uninst_done.emit(f"扫描已取消，耗时 {time.time()-t0:.1f} 秒")
+            return
 
         user_count = 0
         system_count = 0
@@ -3613,27 +4785,7 @@ class UninstallPage(ScrollArea):
         self.sig.uninst_done.emit(f"标准卸载流程结束：成功 {ok}，失败 {fl}，跳过 {sk}，耗时 {time.time()-t0:.1f} 秒")
 
     def _verify_uninstall_result(self, app_name, install_dir, reg_path):
-        messages = []
-        path_text = norm_path(install_dir)
-        if path_text and os.path.exists(path_text):
-            messages.append(f"[卸载校验] {app_name} 安装目录仍存在: {path_text}")
-        if reg_path:
-            hive_name, _, subkey = reg_path.partition("\\")
-            hive_map = {
-                "HKLM": winreg.HKEY_LOCAL_MACHINE,
-                "HKCU": winreg.HKEY_CURRENT_USER,
-                "HKCR": winreg.HKEY_CLASSES_ROOT
-            }
-            hkey = hive_map.get(hive_name)
-            if hkey and subkey:
-                try:
-                    with winreg.OpenKey(hkey, subkey):
-                        messages.append(f"[卸载校验] {app_name} 卸载注册表项仍存在")
-                except OSError:
-                    pass
-        if not messages:
-            messages.append(f"[卸载校验] {app_name} 主要卸载痕迹已移除")
-        return messages
+        return _verify_uninstall_result_messages(app_name, install_dir, reg_path)
 
     @Slot()
     def prompt_leftover_scan(self):
@@ -4637,6 +5789,7 @@ class MainWindow(FluentWindow):
         self.pg_rule_store = RuleStorePage(self, self)
         self.pg_big = BigFilePage(self.sig, self.big_stop, self)
         self.pg_uninstall = UninstallPage(self.sig, self.uninstall_stop, self)
+        self.pg_schedule = SchedulePage(self, self)
         self.pg_more = MoreCleanPage(self.sig, self.more_stop, self)
         self.pg_setting = SettingPage(self, self)
         self._update_lock = threading.Lock()
@@ -4865,6 +6018,7 @@ class MainWindow(FluentWindow):
             ("常规清理", getattr(self.pg_clean, "log", None)),
             ("大文件扫描", getattr(self.pg_big, "log", None)),
             ("应用强力卸载", getattr(self.pg_uninstall, "log", None)),
+            ("定时任务", getattr(self.pg_schedule, "log", None)),
             ("更多清理", getattr(self.pg_more, "log", None)),
         ]
         for title, widget in page_logs:
@@ -4905,6 +6059,7 @@ class MainWindow(FluentWindow):
         self.navigationInterface.setExpandWidth(200); self.navigationInterface.setCollapsible(True)
         self.addSubInterface(self.pg_clean, FIF.BROOM, "常规清理")
         self.addSubInterface(self.pg_rule_store, FIF.DOCUMENT, "规则商店")
+        self.addSubInterface(self.pg_schedule, FIF.SYNC, "定时任务")
         self.addSubInterface(self.pg_big,   FIF.ZOOM,  "大文件扫描")
         self.addSubInterface(self.pg_uninstall, FIF.APPLICATION, "应用强力卸载")
         self.addSubInterface(self.pg_more,  FIF.MORE,  "更多清理")
@@ -5194,8 +6349,25 @@ def relaunch_as_admin():
     sys.exit(0)
 
 def main():
-    if sys.platform != "win32": sys.exit(1)
-    if not is_admin(): relaunch_as_admin()
+    if sys.platform != "win32":
+        sys.exit(1)
+
+    if "--scheduled-clean" in sys.argv:
+        permanent_delete = "--scheduled-recycle" not in sys.argv
+        features = {arg[len("--feature-"):] for arg in sys.argv if arg.startswith("--feature-")}
+        task_name = ""
+        if "--scheduled-task-name" in sys.argv:
+            try:
+                idx = sys.argv.index("--scheduled-task-name")
+                task_name = sys.argv[idx + 1]
+            except Exception:
+                task_name = ""
+        if not features:
+            features = {"clean"}
+        sys.exit(run_scheduled_job(permanent_delete=permanent_delete, features=features, task_name=task_name))
+
+    if not is_admin():
+        relaunch_as_admin()
     app = QApplication(sys.argv); setFontFamilies(["微软雅黑"]); setTheme(Theme.AUTO); setThemeColor("#0078d4")
     w = MainWindow(); w.show(); sys.exit(app.exec())
 
