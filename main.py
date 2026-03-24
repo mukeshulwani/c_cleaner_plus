@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-C盘强力清理工具 v0.3.8-alpha01
+C盘强力清理工具 v0.3.8-alpha02
 PySide6 + PySide6-Fluent-Widgets (Fluent2 UI)
 包含：常规清理(支持拖拽排序与自定义规则)、大文件扫描、重复文件、空文件夹、无效快捷方式等
 """
@@ -35,9 +35,10 @@ from qfluentwidgets import (
 # ══════════════════════════════════════════════════════════
 #  版本与更新配置
 # ══════════════════════════════════════════════════════════
-CURRENT_VERSION = "0.3.8-alpha01"
+CURRENT_VERSION = "0.3.8-alpha02"
 UPDATE_JSON_URL = "https://gitee.com/kio0/c_cleaner_plus/raw/master/update.json"
 APP_SCHEDULED_TASK_PREFIX = "C盘强力清理工具 - "
+APP_AUTOSTART_TASK_NAME = "C盘强力清理工具 开机自启"
 
 from qfluentwidgets.components.widgets.table_view import TableItemDelegate
 
@@ -202,6 +203,15 @@ def _get_background_python():
             return pyw
     return exe
 
+def build_app_launch_command(extra_args=None):
+    if getattr(sys, "frozen", False):
+        args = [os.path.abspath(sys.executable)]
+    else:
+        args = [_get_background_python(), os.path.abspath(__file__)]
+    if extra_args:
+        args.extend(extra_args)
+    return subprocess.list2cmdline(args)
+
 def build_scheduled_clean_command(permanent_delete=True, features=None, task_name=""):
     if getattr(sys, "frozen", False):
         args = [os.path.abspath(sys.executable), "--scheduled-clean"]
@@ -239,22 +249,61 @@ def _run_hidden_command(args):
         creationflags=subprocess.CREATE_NO_WINDOW
     )
 
-def create_scheduled_clean_task(task_name, schedule_type, time_text="", weekday_label="周一", permanent_delete=True, features=None):
+def is_app_auto_start_enabled():
+    result = _run_hidden_command(["schtasks", "/Query", "/TN", APP_AUTOSTART_TASK_NAME])
+    return result.returncode == 0
+
+def set_app_auto_start_enabled(enabled):
+    if enabled:
+        cmd = [
+            "schtasks", "/Create",
+            "/TN", APP_AUTOSTART_TASK_NAME,
+            "/TR", build_app_launch_command(),
+            "/SC", "ONLOGON",
+            "/RL", "HIGHEST",
+            "/F"
+        ]
+        result = _run_hidden_command(cmd)
+        if result.returncode == 0:
+            return True, "开机自启已开启"
+    else:
+        result = _run_hidden_command(["schtasks", "/Delete", "/TN", APP_AUTOSTART_TASK_NAME, "/F"])
+        if result.returncode == 0:
+            return True, "开机自启已关闭"
+
+    err = (result.stderr or result.stdout or "").strip() or "未知错误"
+    return False, err
+
+def create_scheduled_clean_task(task_name, schedule_type, time_text="", weekday_label="周一", permanent_delete=True, features=None, schedule_interval=1):
     full_name = _normalize_task_name(task_name)
     command_text = build_scheduled_clean_command(permanent_delete=permanent_delete, features=features, task_name=full_name)
     cmd = ["schtasks", "/Create", "/TN", full_name, "/TR", command_text, "/RL", "HIGHEST", "/F"]
+    try:
+        interval = max(1, int(schedule_interval or 1))
+    except Exception:
+        interval = 1
 
     schedule_key = str(schedule_type or "").strip().lower()
     if schedule_key == "daily":
         valid_time = _validate_schedule_time(time_text)
         if not valid_time:
             return False, "每日任务需要填写有效时间（HH:MM）", full_name
-        cmd.extend(["/SC", "DAILY", "/ST", valid_time])
+        cmd.extend(["/SC", "DAILY", "/MO", str(interval), "/ST", valid_time])
     elif schedule_key == "weekly":
         valid_time = _validate_schedule_time(time_text)
         if not valid_time:
             return False, "每周任务需要填写有效时间（HH:MM）", full_name
-        cmd.extend(["/SC", "WEEKLY", "/D", _weekday_label_to_code(weekday_label), "/ST", valid_time])
+        cmd.extend(["/SC", "WEEKLY", "/MO", str(interval), "/D", _weekday_label_to_code(weekday_label), "/ST", valid_time])
+    elif schedule_key == "hourly":
+        valid_time = _validate_schedule_time(time_text)
+        if not valid_time:
+            return False, "每小时任务需要填写有效起始时间（HH:MM）", full_name
+        cmd.extend(["/SC", "HOURLY", "/MO", str(interval), "/ST", valid_time])
+    elif schedule_key == "minute":
+        valid_time = _validate_schedule_time(time_text)
+        if not valid_time:
+            return False, "每分钟任务需要填写有效起始时间（HH:MM）", full_name
+        cmd.extend(["/SC", "MINUTE", "/MO", str(interval), "/ST", valid_time])
     elif schedule_key == "logon":
         cmd.extend(["/SC", "ONLOGON"])
     else:
@@ -303,10 +352,31 @@ $tasks = Get-ScheduledTask -ErrorAction SilentlyContinue | Where-Object {{ $_.Ta
                 $days = [string]$trigger.DaysOfWeek
             }}
         }} catch {{}}
+        $daysInterval = ''
+        try {{
+            if ($trigger.DaysInterval) {{
+                $daysInterval = [int]$trigger.DaysInterval
+            }}
+        }} catch {{}}
+        $weeksInterval = ''
+        try {{
+            if ($trigger.WeeksInterval) {{
+                $weeksInterval = [int]$trigger.WeeksInterval
+            }}
+        }} catch {{}}
+        $interval = ''
+        try {{
+            if ($trigger.Repetition -and $trigger.Repetition.Interval) {{
+                $interval = [string]$trigger.Repetition.Interval
+            }}
+        }} catch {{}}
         $triggers += [pscustomobject]@{{
             Class = $cls
             Start = $start
             Days = $days
+            DaysInterval = $daysInterval
+            WeeksInterval = $weeksInterval
+            Interval = $interval
         }}
     }}
     [pscustomobject]@{{
@@ -349,17 +419,45 @@ def format_scheduled_trigger_text(triggers):
         "Saturday": "周六",
         "Sunday": "周日",
     }
+
+    def _format_repetition_interval(interval_text):
+        text = str(interval_text or "").strip().upper()
+        if not text:
+            return ""
+        m = re.fullmatch(r"P(?:0DT)?(?:(\d+)H)?(?:(\d+)M)?(?:0S)?", text)
+        if not m:
+            m = re.fullmatch(r"PT(?:(\d+)H)?(?:(\d+)M)?", text)
+        if not m:
+            return ""
+        hours = int(m.group(1) or 0)
+        minutes = int(m.group(2) or 0)
+        if hours and not minutes:
+            return f"每 {hours} 小时"
+        if minutes and not hours:
+            return f"每 {minutes} 分钟"
+        if hours and minutes:
+            return f"每 {hours} 小时 {minutes} 分钟"
+        return ""
+
     for trigger in triggers:
         if not isinstance(trigger, dict):
             continue
         cls = str(trigger.get("Class", "")).strip()
         start = str(trigger.get("Start", "")).strip()
         days = str(trigger.get("Days", "")).strip()
-        if cls == "MSFT_TaskDailyTrigger":
-            parts.append(f"每天 {start}" if start else "每天")
+        days_interval = int(trigger.get("DaysInterval") or 0) if str(trigger.get("DaysInterval", "")).strip() else 0
+        weeks_interval = int(trigger.get("WeeksInterval") or 0) if str(trigger.get("WeeksInterval", "")).strip() else 0
+        interval = str(trigger.get("Interval", "")).strip().upper()
+        repetition_text = _format_repetition_interval(interval)
+        if repetition_text:
+            parts.append(f"{repetition_text} {start}".strip() if start else repetition_text)
+        elif cls == "MSFT_TaskDailyTrigger":
+            prefix = "每天" if days_interval <= 1 else f"每 {days_interval} 天"
+            parts.append(f"{prefix} {start}".strip() if start else prefix)
         elif cls == "MSFT_TaskWeeklyTrigger":
             day_text = day_map.get(days, days or "每周")
-            parts.append(f"每周 {day_text} {start}".strip())
+            prefix = "每周" if weeks_interval <= 1 else f"每 {weeks_interval} 周"
+            parts.append(f"{prefix} {day_text} {start}".strip())
         elif cls == "MSFT_TaskLogonTrigger":
             parts.append("登录时")
         else:
@@ -1611,7 +1709,8 @@ def _walk_files_headless(roots, excl, workers, stop_event=None, ext_filter=None,
                 continue
             try:
                 entries = os.scandir(d)
-            except Exception:
+            except Exception as e:
+                log_sampled_background_error("定时任务遍历目录", e)
                 dir_queue.task_done()
                 continue
             try:
@@ -1633,13 +1732,13 @@ def _walk_files_headless(roots, excl, workers, stop_event=None, ext_filter=None,
                             if collect_files:
                                 with lock:
                                     res_files.append(entry.path)
-                    except Exception:
-                        pass
+                    except Exception as e:
+                        log_sampled_background_error("定时任务扫描条目", e)
             finally:
                 try:
                     entries.close()
-                except Exception:
-                    pass
+                except Exception as e:
+                    log_sampled_background_error("定时任务关闭扫描句柄", e, limit=3)
             dir_queue.task_done()
 
     threads = []
@@ -2024,10 +2123,10 @@ def _run_scheduled_empty_dirs(permanent_delete, log):
                 elif item.is_dir(follow_symlinks=False) and item.path not in empty_set:
                     is_empty = False
                     break
-            if is_empty:
-                empty_set.add(d)
-        except Exception:
-            pass
+                if is_empty:
+                    empty_set.add(d)
+        except Exception as e:
+            log_sampled_background_error("定时任务空文件夹扫描", e)
     if not empty_set:
         log("[空文件夹清理] 未发现空文件夹")
         return
@@ -2057,10 +2156,10 @@ def _run_scheduled_shortcuts(permanent_delete, log):
                     m = re.search(rb'[a-zA-Z]:\\[^\x00]+', f.read())
                     if m:
                         return m.group().decode('mbcs', 'ignore')
-            except Exception:
-                pass
-        except Exception:
-            pass
+            except Exception as e:
+                log_sampled_background_error("定时任务解析快捷方式", e)
+        except Exception as e:
+            log_sampled_background_error("定时任务解析快捷方式", e)
         return ""
 
     invalid = []
@@ -3142,7 +3241,7 @@ class SchedulePage(ScrollArea):
         root.setSpacing(10)
         root.addLayout(make_title_row(FIF.SYNC, "定时任务"))
 
-        desc = CaptionLabel("创建 Windows 定时任务，按每天、每周或登录时自动执行选定的清理功能")
+        desc = CaptionLabel("创建 Windows 定时任务，按自定义天/周/小时/分钟间隔或登录时自动执行选定功能")
         desc.setWordWrap(True)
         desc.setTextColor(QColor(128, 128, 128))
         root.addWidget(desc)
@@ -3161,14 +3260,25 @@ class SchedulePage(ScrollArea):
         row1.addWidget(self.name_input, 1)
         row1.addWidget(StrongBodyLabel("触发方式:"))
         self.cb_schedule = ComboBox()
-        self.cb_schedule.addItems(["每天", "每周", "登录时"])
+        self.cb_schedule.addItems(["每天", "每周", "每小时", "每分钟", "登录时"])
         self.cb_schedule.currentIndexChanged.connect(self._sync_trigger_widgets)
         row1.addWidget(self.cb_schedule)
         form_layout.addLayout(row1)
 
         row2 = QHBoxLayout()
         row2.setSpacing(10)
+        self.lbl_interval = StrongBodyLabel("间隔:")
+        row2.addWidget(self.lbl_interval)
+        self.sp_schedule_interval = SpinBox()
+        self.sp_schedule_interval.setRange(1, 999)
+        self.sp_schedule_interval.setValue(1)
+        self.sp_schedule_interval.setFixedWidth(110)
+        row2.addWidget(self.sp_schedule_interval)
+        self.lbl_interval_unit = CaptionLabel("天")
+        self.lbl_interval_unit.setTextColor(QColor(128, 128, 128))
+        row2.addWidget(self.lbl_interval_unit)
         self.lbl_time = StrongBodyLabel("执行时间:")
+        self.lbl_time.setToolTip("每天/每周：在该时间执行；每小时/每分钟：从该时间开始按设定间隔循环执行")
         row2.addWidget(self.lbl_time)
         self.time_input = LineEdit()
         self.time_input.setPlaceholderText("HH:MM")
@@ -3290,8 +3400,26 @@ class SchedulePage(ScrollArea):
         append_capped_log(self.log, line)
 
     def _sync_trigger_widgets(self):
-        is_weekly = self.cb_schedule.currentIndex() == 1
-        is_logon = self.cb_schedule.currentIndex() == 2
+        idx = self.cb_schedule.currentIndex()
+        is_weekly = idx == 1
+        is_hourly = idx == 2
+        is_minute = idx == 3
+        is_logon = idx == 4
+        interval_ranges = {
+            0: (1, 365, "天"),
+            1: (1, 52, "周"),
+            2: (1, 23, "小时"),
+            3: (1, 1439, "分钟"),
+        }
+        min_v, max_v, unit = interval_ranges.get(idx, (1, 1, ""))
+        self.sp_schedule_interval.setRange(min_v, max_v)
+        if self.sp_schedule_interval.value() < min_v or self.sp_schedule_interval.value() > max_v:
+            self.sp_schedule_interval.setValue(min_v)
+        self.lbl_interval.setVisible(not is_logon)
+        self.sp_schedule_interval.setVisible(not is_logon)
+        self.lbl_interval_unit.setVisible(not is_logon)
+        self.lbl_interval_unit.setText(unit)
+        self.lbl_time.setText("起始时间:")
         self.lbl_time.setVisible(not is_logon)
         self.time_input.setVisible(not is_logon)
         self.lbl_weekday.setVisible(is_weekly)
@@ -3358,9 +3486,10 @@ class SchedulePage(ScrollArea):
     def _create_task(self):
         raw_name = self.name_input.text().strip() or "自动常规清理"
         schedule_index = self.cb_schedule.currentIndex()
-        schedule_type = {0: "daily", 1: "weekly", 2: "logon"}.get(schedule_index, "daily")
+        schedule_type = {0: "daily", 1: "weekly", 2: "hourly", 3: "minute", 4: "logon"}.get(schedule_index, "daily")
         time_text = self.time_input.text().strip()
         weekday_label = self.cb_weekday.currentText().strip()
+        schedule_interval = self.sp_schedule_interval.value()
         features = set()
         if self.chk_feat_clean.isChecked():
             features.add("clean")
@@ -3385,6 +3514,7 @@ class SchedulePage(ScrollArea):
             weekday_label=weekday_label,
             permanent_delete=self.chk_permanent.isChecked(),
             features=features,
+            schedule_interval=schedule_interval,
         )
         if ok:
             preset = {
@@ -3469,6 +3599,11 @@ class SettingPage(ScrollArea):
         self.switch_protect_builtin.setChecked(self.main_win.global_settings.get("protect_builtin_rules", True))
         self.switch_protect_builtin.checkedChanged.connect(self._on_protect_builtin_changed)
 
+        self.switch_auto_start = SwitchButton()
+        self.switch_auto_start.setOnText("开启"); self.switch_auto_start.setOffText("关闭")
+        self.switch_auto_start.setChecked(self.main_win.global_settings.get("auto_start", False))
+        self.switch_auto_start.checkedChanged.connect(self._on_auto_start_changed)
+
         btn_cache = PushButton(FIF.SYNC, "刷新")
         btn_cache.clicked.connect(self._refresh_cache)
         self._style_action_control(btn_cache, 86)
@@ -3525,6 +3660,12 @@ class SettingPage(ScrollArea):
                 "内置默认规则保护",
                 "开启后内置规则无法删除；关闭后可删除，且删除状态会保留到下次启动",
                 self.switch_protect_builtin
+            ),
+            self._make_setting_row(
+                FIF.APPLICATION,
+                "开机自启",
+                "开启后，启动 Windows 时会自动启动本软件，无需手动打开软件",
+                self.switch_auto_start
             ),
             self._make_setting_row(
                 FIF.SYNC,
@@ -3727,6 +3868,19 @@ class SettingPage(ScrollArea):
     def _on_protect_builtin_changed(self, is_checked):
         self.main_win.global_settings["protect_builtin_rules"] = is_checked
         self.main_win.save_global_settings()
+
+    def _on_auto_start_changed(self, is_checked):
+        ok, msg = set_app_auto_start_enabled(is_checked)
+        if ok:
+            self.main_win.global_settings["auto_start"] = is_checked
+            self.main_win.save_global_settings()
+            InfoBar.success("已更新", msg, parent=self.main_win)
+            return
+
+        self.switch_auto_start.blockSignals(True)
+        self.switch_auto_start.setChecked(not is_checked)
+        self.switch_auto_start.blockSignals(False)
+        InfoBar.error("更新失败", msg, parent=self.main_win)
 
     def _refresh_config_dir_text(self):
         cur_dir = self.main_win.config_dir
@@ -4331,7 +4485,9 @@ class CleanPage(ScrollArea):
                 elif tp=="file":
                     if delete_path(p,pm,lf): ok+=1
                     else: fl+=1
-            except Exception: fl+=1
+            except Exception as e:
+                fl += 1
+                lf(f"[规则失败] {nm} -> {p} -> {format_exception_text(e)}")
             self.sig.clean_prog.emit(st,tot)
         self.sig.clean_done.emit(f"清理完成：成功 {ok}，失败 {fl}，耗时 {time.time()-t0:.1f} 秒")
 
@@ -5373,6 +5529,8 @@ class MoreCleanPage(ScrollArea):
                             file_size = 0
                         seen_offsets = set()
                         for offset, size in sample_offsets:
+                            if self.stop.is_set():
+                                return None
                             if size <= 0 or file_size <= 0:
                                 continue
                             real_offset = max(0, min(offset, max(0, file_size - size)))
@@ -5382,6 +5540,8 @@ class MoreCleanPage(ScrollArea):
                             f.seek(real_offset)
                             m.update(f.read(size))
                     elif head_bytes is not None:
+                        if self.stop.is_set():
+                            return None
                         head = f.read(head_bytes)
                         m.update(head)
                         if tail_bytes > 0:
@@ -5390,10 +5550,14 @@ class MoreCleanPage(ScrollArea):
                             except Exception:
                                 file_size = len(head)
                             if file_size > len(head):
+                                if self.stop.is_set():
+                                    return None
                                 f.seek(max(0, file_size - tail_bytes))
                                 m.update(f.read(tail_bytes))
                     else:
                         for chunk in iter(lambda: f.read(1024 * 1024), b''):
+                            if self.stop.is_set():
+                                return None
                             m.update(chunk)
                 return m.hexdigest()
             except Exception:
@@ -5425,15 +5589,21 @@ class MoreCleanPage(ScrollArea):
 
             quick_dict = defaultdict(list)
             for p in paths:
+                if self.stop.is_set():
+                    break
                 sig = _get_quick_hash(p, file_size)
                 if sig:
                     quick_dict[sig].append(p)
 
             for quick_paths in quick_dict.values():
+                if self.stop.is_set():
+                    break
                 if len(quick_paths) < 2:
                     continue
                 full_dict = defaultdict(list)
                 for p in quick_paths:
+                    if self.stop.is_set():
+                        break
                     fh = _get_hash(p)
                     if fh:
                         full_dict[fh].append(p)
@@ -5484,7 +5654,8 @@ class MoreCleanPage(ScrollArea):
                     if item.is_file(follow_symlinks=False): is_empty = False; break
                     elif item.is_dir(follow_symlinks=False) and item.path not in empty_set: is_empty = False; break
                 if is_empty: empty_set.add(d); self.sig.more_add.emit(False, "空文件夹", os.path.basename(d), "无内容", d)
-            except Exception: pass
+            except Exception as e:
+                log_sampled_background_error("空文件夹扫描", e)
         if self.stop.is_set():
             self.sig.more_done.emit(f"扫描已取消，耗时 {time.time()-t0:.1f} 秒")
             return
@@ -5721,6 +5892,7 @@ class MainWindow(FluentWindow):
         self.legacy_config_dir = os.environ.get("LOCALAPPDATA", "")
         self.global_settings = {
             "auto_save": True,
+            "auto_start": False,
             "update_channel": "stable",
             "protect_builtin_rules": True,
             "deleted_builtin_rules": []
@@ -5731,6 +5903,10 @@ class MainWindow(FluentWindow):
                     self.global_settings.update(json.load(f))
             except Exception as e:
                 log_background_error("加载全局设置失败", e)
+        try:
+            self.global_settings["auto_start"] = is_app_auto_start_enabled()
+        except Exception as e:
+            log_background_error("读取开机自启状态失败", e)
 
         self.targets = [parse_rule_entry(t) for t in default_clean_targets()]
         self.targets = [t for t in self.targets if t]
@@ -5883,9 +6059,11 @@ class MainWindow(FluentWindow):
             self.legacy_migration_acknowledged = True
             self._save_config_locator()
             if cleanup_old:
-                InfoBar.success("迁移完成", "旧版配置已迁移并清理旧文件，重启软件后生效", parent=self)
+                success_text = detail or "旧版配置已迁移并清理旧文件，重启软件后生效"
+                InfoBar.success("迁移完成", success_text, parent=self)
             else:
-                InfoBar.success("迁移完成", "旧版配置已迁移，旧文件已保留，重启软件后生效", parent=self)
+                success_text = detail or "旧版配置已迁移，旧文件已保留，重启软件后生效"
+                InfoBar.success("迁移完成", success_text, parent=self)
             return True
 
         InfoBar.error("迁移失败", detail, parent=self)
@@ -5913,15 +6091,26 @@ class MainWindow(FluentWindow):
             if not copied:
                 return False, "未找到可迁移的旧版配置文件"
 
+            cleanup_failures = []
             if cleanup_old:
                 for src in legacy_paths.values():
                     try:
                         if os.path.exists(src):
                             os.remove(src)
-                    except Exception:
-                        pass
+                    except Exception as e:
+                        cleanup_failures.append(f"{display_path(src)} -> {format_exception_text(e)}")
+
+            if cleanup_failures:
+                append_session_log_line(f"[{time.strftime('%H:%M:%S')}] [迁移旧配置] 部分旧文件未删除")
+                for item in cleanup_failures[:8]:
+                    append_session_log_line(f"[{time.strftime('%H:%M:%S')}] [迁移旧配置] {item}")
+                extra = len(cleanup_failures) - min(len(cleanup_failures), 8)
+                if extra > 0:
+                    append_session_log_line(f"[{time.strftime('%H:%M:%S')}] [迁移旧配置] 另有 {extra} 项未展开")
 
             self._save_config_locator()
+            if cleanup_failures:
+                return True, f"旧版配置已迁移，但有 {len(cleanup_failures)} 个旧文件未删除"
             return True, ""
         except Exception as e:
             return False, f"迁移配置文件失败: {e}"
@@ -6331,12 +6520,23 @@ class MainWindow(FluentWindow):
         MessageBox("关于", f"C盘强力清理工具 v{CURRENT_VERSION}\nQQ交流群：670804369\nUI：Fluent Widgets\nby Kio",self).exec()
 
 def relaunch_as_admin():
+    def _show_relaunch_error(message):
+        try:
+            ctypes.windll.user32.MessageBoxW(
+                None,
+                str(message),
+                "C盘强力清理工具",
+                0x00000010
+            )
+        except Exception:
+            print(message, file=sys.stderr)
+
     try:
         if getattr(sys, "frozen", False):
             params = subprocess.list2cmdline(sys.argv[1:])
         else:
             params = subprocess.list2cmdline(sys.argv)
-        ctypes.windll.shell32.ShellExecuteW(
+        result = ctypes.windll.shell32.ShellExecuteW(
             None,
             "runas",
             sys.executable,
@@ -6344,9 +6544,13 @@ def relaunch_as_admin():
             None,
             1
         )
-    except Exception:
-        pass
-    sys.exit(0)
+        if int(result) <= 32:
+            _show_relaunch_error("未能获取管理员权限。你可能取消了 UAC 提示，或系统拒绝了提权请求。")
+            return False
+    except Exception as e:
+        _show_relaunch_error(f"启动管理员模式失败：{format_exception_text(e)}")
+        return False
+    return True
 
 def main():
     if sys.platform != "win32":
@@ -6367,7 +6571,9 @@ def main():
         sys.exit(run_scheduled_job(permanent_delete=permanent_delete, features=features, task_name=task_name))
 
     if not is_admin():
-        relaunch_as_admin()
+        if relaunch_as_admin():
+            sys.exit(0)
+        sys.exit(1)
     app = QApplication(sys.argv); setFontFamilies(["微软雅黑"]); setTheme(Theme.AUTO); setThemeColor("#0078d4")
     w = MainWindow(); w.show(); sys.exit(app.exec())
 
