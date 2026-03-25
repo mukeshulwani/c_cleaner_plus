@@ -1,18 +1,18 @@
 # -*- coding: utf-8 -*-
 """
-C盘强力清理工具 v0.3.9
+C盘强力清理工具 v0.4.5-alpha01
 PySide6 + PySide6-Fluent-Widgets (Fluent2 UI)
 包含：常规清理(支持拖拽排序与自定义规则)、大文件扫描、重复文件、空文件夹、无效快捷方式等
 """
 
-import os, sys, time, ctypes, threading, subprocess, queue, json, hashlib, winreg, re, heapq, tempfile
+import os, sys, time, ctypes, threading, subprocess, queue, json, hashlib, winreg, re, heapq, tempfile, gc
 import urllib.request
 import webbrowser
 from collections import defaultdict
 
 from PySide6.QtCore import Qt, Signal, QObject, QPoint, QMetaObject, Slot, QFileInfo, QSize, QTimer
 from PySide6.QtGui import QFont, QIcon, QColor, QPainter, QDrag, QPixmap, QRegion, QTextCursor
-from qfluentwidgets import isDarkTheme, themeColor
+from qfluentwidgets import isDarkTheme, themeColor, qconfig
 from PySide6.QtWidgets import (
     QApplication, QWidget, QVBoxLayout, QHBoxLayout,
     QAbstractItemView, QTableWidgetItem, QStyledItemDelegate,
@@ -23,7 +23,7 @@ from PySide6.QtWidgets import (
 from qfluentwidgets import (
     FluentIcon as FIF,
     setTheme, Theme, setThemeColor, setFontFamilies, setFont,
-    NavigationItemPosition, FluentWindow,
+    NavigationItemPosition, MSFluentWindow, NavigationInterface, NavigationBar,
     PushButton, PrimaryPushButton, ComboBox, SwitchButton,
     CheckBox, SpinBox, ProgressBar,
     TitleLabel, CaptionLabel, StrongBodyLabel,
@@ -31,22 +31,35 @@ from qfluentwidgets import (
     RoundMenu, Action, MessageBox, InfoBar, InfoBarPosition, ScrollArea,
     SearchLineEdit, MessageBoxBase, LineEdit, ToolButton
 )
+from qfluentwidgets.common.router import qrouter
 
 # ══════════════════════════════════════════════════════════
 #  版本与更新配置
 # ══════════════════════════════════════════════════════════
-CURRENT_VERSION = "0.3.9"
+CURRENT_VERSION = "0.4.5-alpha01"
 UPDATE_JSON_URL = "https://gitee.com/kio0/c_cleaner_plus/raw/master/update.json"
 APP_SCHEDULED_TASK_PREFIX = "C盘强力清理工具 - "
 APP_AUTOSTART_TASK_NAME = "C盘强力清理工具 开机自启"
+SIDEBAR_STYLE_LABELS = {
+    "horizontal": "横向",
+    "vertical": "纵向"
+}
+THEME_MODE_LABELS = {
+    "auto": "跟随系统",
+    "light": "浅色",
+    "dark": "深色"
+}
 
 from qfluentwidgets.components.widgets.table_view import TableItemDelegate
 
-SESSION_LOG_MAX_LINES = 4000
+SESSION_LOG_MAX_LINES = 2000
 _session_log_lines = []
 _session_log_lock = threading.Lock()
 _sampled_error_counts = {}
 _sampled_error_lock = threading.Lock()
+_memory_trim_lock = threading.Lock()
+_last_memory_trim_ts = 0.0
+MEMORY_TRIM_COOLDOWN_SEC = 8.0
 
 def resource_path(relative_path):
     if getattr(sys, '_MEIPASS', None): return os.path.join(sys._MEIPASS, relative_path)
@@ -82,6 +95,23 @@ def log_sampled_background_error(context, e, limit=6):
         should_log = count < max(1, int(limit))
     if should_log:
         log_background_error(key, e)
+
+def trim_process_memory(force=False):
+    global _last_memory_trim_ts
+    with _memory_trim_lock:
+        now = time.time()
+        if not force and (now - _last_memory_trim_ts) < MEMORY_TRIM_COOLDOWN_SEC:
+            return False
+        _last_memory_trim_ts = now
+
+    try:
+        gc.collect()
+        handle = ctypes.windll.kernel32.GetCurrentProcess()
+        ctypes.windll.psapi.EmptyWorkingSet(handle)
+        return True
+    except Exception as e:
+        log_sampled_background_error("内存压缩", e, limit=3)
+        return False
 
 def append_error_sample(errors, message, limit=8):
     if len(errors) < limit:
@@ -1558,8 +1588,8 @@ BIGFILE_OPTIONAL_SKIP_NAMES = {"pagefile.sys", "hiberfil.sys", "swapfile.sys", "
 BIGFILE_OPTIONAL_SKIP_EXT = {
     ".vhd", ".vhdx", ".avhd", ".avhdx", ".vmdk", ".vdi", ".qcow", ".qcow2", ".ova", ".ovf"
 }
-DUPLICATE_GROUP_DISPLAY_LIMIT = 200
-LOG_MAX_LINES = 1000
+DUPLICATE_GROUP_DISPLAY_LIMIT = 120
+LOG_MAX_LINES = 600
 
 def should_exclude(p, prefixes):
     n = os.path.normcase(os.path.abspath(p))
@@ -1833,16 +1863,20 @@ def open_explorer(p):
 def make_ctx(parent, table, pos, col):
     idx=table.indexAt(pos)
     if not idx.isValid(): return
-    raw=table.item(idx.row(),col).text() if table.item(idx.row(),col) else ""
+    raw = table.item(idx.row(), col).text() if table.item(idx.row(), col) else ""
     n=norm_path(raw); ex=bool(n) and os.path.exists(n)
     m=RoundMenu(parent=parent)
+    m.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose, True)
     def _copy_path():
         QApplication.clipboard().setText(raw)
         InfoBar.success("复制成功", raw, orient=Qt.Orientation.Horizontal, isClosable=True, position=InfoBarPosition.TOP, duration=2000, parent=parent.window())
     a1=Action(FIF.COPY,"复制");a1.triggered.connect(_copy_path);a1.setEnabled(bool(raw));m.addAction(a1); m.addSeparator()
     a2=Action(FIF.DOCUMENT,"打开"); a2.triggered.connect(lambda:subprocess.Popen(["explorer",n]) if n else None); a2.setEnabled(ex and os.path.isfile(n)); m.addAction(a2)
     a3=Action(FIF.FOLDER,"定位"); a3.triggered.connect(lambda:open_explorer(n)); a3.setEnabled(ex); m.addAction(a3)
-    m.exec(table.viewport().mapToGlobal(pos))
+    try:
+        m.exec(table.viewport().mapToGlobal(pos))
+    finally:
+        m.deleteLater()
 
 def make_check_item(checked=False):
     item = QTableWidgetItem()
@@ -1853,6 +1887,130 @@ def make_check_item(checked=False):
 def is_row_checked(table, row): return table.item(row, 0) is not None and table.item(row, 0).checkState() == Qt.CheckState.Checked
 def set_row_checked(table, row, checked):
     if table.item(row, 0): table.item(row, 0).setCheckState(Qt.CheckState.Checked if checked else Qt.CheckState.Unchecked)
+
+class PageFooterWidget(QWidget):
+    """可复用的页面底部组件：进度条 + 状态标签 + 日志区"""
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(4)
+
+        pg = QHBoxLayout()
+        self.pb = ProgressBar()
+        self.pb.setRange(0, 100)
+        self.pb.setValue(0)
+        self.pb.setFixedHeight(6)
+        pg.addWidget(self.pb, 1)
+        self.sl = CaptionLabel("就绪")
+        pg.addWidget(self.sl)
+        layout.addLayout(pg)
+
+        self.log = TextEdit()
+        self.log.setReadOnly(True)
+        self.log.setMaximumHeight(120)
+        self.log.setFont(QFont("Consolas", 9))
+        self.log.setPlaceholderText("日志...")
+        layout.addWidget(self.log)
+
+    def set_status(self, text, percent=None):
+        display = text[:80] if text else ""
+        if percent is not None and 0 <= percent <= 100:
+            display = f"{display}  {percent}%" if display else f"{percent}%"
+        self.sl.setText(display)
+
+
+class DriveSelector(QWidget):
+    """可复用磁盘多选器，基于 CheckBox + RoundMenu(selectable=False) 实现不关闭菜单的连续多选"""
+    selectionChanged = Signal()
+
+    def __init__(self, default_checked=None, parent=None):
+        super().__init__(parent)
+        layout = QHBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(0)
+
+        self.drives = get_available_drives()
+        self.drive_checks = {}
+        self.drive_states = {}
+        self._containers = {}
+        self._menu_last_close = 0
+
+        self.btn = LeftAlignedPushButton("磁盘: (未选择)")
+        self.btn.setMinimumWidth(220)
+        self.menu = RoundMenu(parent=self)
+
+        for d in self.drives:
+            checked = d in (default_checked or set())
+            self.drive_states[d] = checked
+            chk = CheckBox(d)
+            chk.setChecked(checked)
+            chk.toggled.connect(lambda c, _d=d: self._on_toggled(_d, c))
+            container = QWidget()
+            container.setFixedHeight(36)
+            row_layout = QHBoxLayout(container)
+            row_layout.setContentsMargins(12, 0, 12, 0)
+            row_layout.addWidget(chk)
+            self.menu.addWidget(container, selectable=False)
+            self.drive_checks[d] = chk
+            self._containers[d] = container
+
+        self.btn.clicked.connect(self._show_menu)
+        layout.addWidget(self.btn)
+        self._update_text()
+
+    def selected_drives(self):
+        return [d for d, s in self.drive_states.items() if s]
+
+    def set_drive_visible(self, drive, visible):
+        if drive in self._containers:
+            self._containers[drive].setVisible(visible)
+            if not visible:
+                self.drive_states[drive] = False
+                self.drive_checks[drive].setChecked(False)
+        self._update_text()
+
+    def _on_toggled(self, drive, checked):
+        self.drive_states[drive] = checked
+        self._update_text()
+        self.selectionChanged.emit()
+
+    def _show_menu(self):
+        if time.time() - self._menu_last_close < 0.2:
+            return
+        self.menu.exec(self.btn.mapToGlobal(QPoint(0, self.btn.height() + 2)))
+        self._menu_last_close = time.time()
+
+    def _update_text(self):
+        sel = self.selected_drives()
+        if not sel:
+            txt = "磁盘: (未选择)"
+        elif len(sel) == 1:
+            txt = f"磁盘: {sel[0]}"
+        else:
+            txt = f"磁盘: {sel[0]} 等 {len(sel)} 个"
+        self.btn.setText(txt)
+        self.btn.setToolTip(f"已选磁盘: {', '.join(sel)}" if sel else "未选择磁盘")
+
+
+def toggle_select_all(tbl, btn, check_hidden=False):
+    """切换表格全选/取消全选，并更新按钮文字和图标"""
+    rows = list(range(tbl.rowCount())) if check_hidden else [
+        r for r in range(tbl.rowCount()) if not tbl.isRowHidden(r)
+    ]
+    if not rows:
+        return
+    all_checked = all(is_row_checked(tbl, r) for r in rows)
+    new_state = not all_checked
+    for r in rows:
+        set_row_checked(tbl, r, new_state)
+    if new_state:
+        btn.setText("取消全选")
+        btn.setIcon(FIF.CLOSE)
+    else:
+        btn.setText("全选")
+        btn.setIcon(FIF.ACCEPT)
+
 
 def make_title_row(icon: FIF, text: str):
     row = QHBoxLayout(); row.setSpacing(8)
@@ -1994,6 +2152,31 @@ def get_runtime_config_paths(config_dir=None):
         "custom": os.path.join(target_dir, "cdisk_cleaner_custom_rules.json"),
         "config": os.path.join(target_dir, "cdisk_cleaner_config.json")
     }
+
+def normalize_theme_mode(theme_mode):
+    mode = str(theme_mode or "").strip().lower()
+    return mode if mode in THEME_MODE_LABELS else "auto"
+
+def resolve_theme_enum(theme_mode):
+    mode = normalize_theme_mode(theme_mode)
+    return {
+        "auto": Theme.AUTO,
+        "light": Theme.LIGHT,
+        "dark": Theme.DARK
+    }.get(mode, Theme.AUTO)
+
+def load_runtime_global_settings(config_dir=None):
+    paths = get_runtime_config_paths(config_dir)
+    path = paths["global"]
+    try:
+        if not os.path.exists(path):
+            return {}
+        with open(path, "r", encoding="utf-8") as f:
+            payload = json.load(f)
+        return payload if isinstance(payload, dict) else {}
+    except Exception as e:
+        log_background_error("读取运行时全局设置失败", e)
+        return {}
 
 def load_runtime_targets_and_settings():
     paths = get_runtime_config_paths()
@@ -2683,6 +2866,7 @@ def resolve_rule_pack(title_text, filename, parent=None, base_dir=None):
 class AddRuleDialog(MessageBoxBase):
     def __init__(self, parent=None):
         super().__init__(parent)
+        self.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose, True)
         self.customTitle = TitleLabel("添加自定义清理规则")
         setFont(self.customTitle, 16, QFont.Weight.Bold)
         self.viewLayout.addWidget(self.customTitle)
@@ -2765,6 +2949,7 @@ class AddRuleDialog(MessageBoxBase):
 class LegacyMigrationDialog(MessageBoxBase):
     def __init__(self, old_dir, new_dir, parent=None):
         super().__init__(parent)
+        self.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose, True)
         self.setWindowTitle("发现旧版配置")
         self.customTitle = TitleLabel("发现旧版配置")
         setFont(self.customTitle, 16, QFont.Weight.Bold)
@@ -2795,6 +2980,7 @@ class LegacyMigrationDialog(MessageBoxBase):
 class RulePackManagerDialog(MessageBoxBase):
     def __init__(self, main_win, store_items, parent=None):
         super().__init__(main_win if main_win is not None else parent)
+        self.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose, True)
         self.main_win = main_win
         self.store_items = list(store_items or [])
         self.setWindowTitle("规则包管理")
@@ -3100,6 +3286,7 @@ class RuleStorePage(ScrollArea):
 class ScheduledUninstallDialog(MessageBoxBase):
     def __init__(self, selected_regs=None, parent=None):
         super().__init__(parent)
+        self.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose, True)
         self.selected_regs = {str(x or "").strip().lower() for x in (selected_regs or []) if str(x or "").strip()}
         self.setWindowTitle("选择定时卸载应用")
         self.widget.setMinimumWidth(900)
@@ -3580,14 +3767,15 @@ class SettingPage(ScrollArea):
     def __init__(self, main_win, parent=None):
         super().__init__(parent)
         self.main_win = main_win
-        self.view = QWidget(); self.setWidget(self.view); self.setWidgetResizable(True); self.setObjectName("settingPage"); self.enableTransparentBackground()
+        self.view = QWidget(); self.view.setObjectName("settingPageView"); self.setWidget(self.view); self.setWidgetResizable(True); self.setObjectName("settingPage"); self.enableTransparentBackground()
+        self.viewport().setObjectName("settingPageViewport")
         self._apply_setting_style()
 
         v = QVBoxLayout(self.view); v.setContentsMargins(28, 12, 28, 24); v.setSpacing(10)
         v.addLayout(make_title_row(FIF.SETTING, "系统设置"))
-        top_hint = CaptionLabel("管理保存策略、配置目录和更新通道")
-        top_hint.setTextColor(QColor(128, 128, 128))
-        v.addWidget(top_hint)
+        self.top_hint = CaptionLabel("管理主题、保存策略、配置目录和更新通道")
+        self.top_hint.setObjectName("settingTopHint")
+        v.addWidget(self.top_hint)
 
         self.switch_save = SwitchButton()
         self.switch_save.setOnText("开启"); self.switch_save.setOffText("关闭")
@@ -3603,6 +3791,24 @@ class SettingPage(ScrollArea):
         self.switch_auto_start.setOnText("开启"); self.switch_auto_start.setOffText("关闭")
         self.switch_auto_start.setChecked(self.main_win.global_settings.get("auto_start", False))
         self.switch_auto_start.checkedChanged.connect(self._on_auto_start_changed)
+
+        self.cb_theme_mode = ComboBox()
+        self.cb_theme_mode.addItems([
+            THEME_MODE_LABELS["auto"],
+            THEME_MODE_LABELS["light"],
+            THEME_MODE_LABELS["dark"]
+        ])
+        saved_theme_mode = normalize_theme_mode(self.main_win.global_settings.get("theme_mode", "auto"))
+        self.cb_theme_mode.setCurrentIndex({"auto": 0, "light": 1, "dark": 2}.get(saved_theme_mode, 0))
+        self.cb_theme_mode.currentIndexChanged.connect(self._on_theme_mode_changed)
+        self.cb_theme_mode.setFixedWidth(116)
+
+        self.cb_sidebar_style = ComboBox()
+        self.cb_sidebar_style.addItems([SIDEBAR_STYLE_LABELS["horizontal"], SIDEBAR_STYLE_LABELS["vertical"]])
+        saved_sidebar_style = self.main_win.global_settings.get("sidebar_style", "vertical")
+        self.cb_sidebar_style.setCurrentIndex(0 if saved_sidebar_style == "horizontal" else 1)
+        self.cb_sidebar_style.currentIndexChanged.connect(self._on_sidebar_style_changed)
+        self.cb_sidebar_style.setFixedWidth(116)
 
         btn_cache = PushButton(FIF.SYNC, "刷新")
         btn_cache.clicked.connect(self._refresh_cache)
@@ -3639,11 +3845,11 @@ class SettingPage(ScrollArea):
         self._style_action_control(btn_export_logs, 86)
 
         self.lbl_config_dir = CaptionLabel("")
-        self.lbl_config_dir.setTextColor(QColor(128, 128, 128))
+        self.lbl_config_dir.setObjectName("settingDetailLabel")
         self.lbl_config_dir.setWordWrap(True)
 
         self.lbl_latest_version = CaptionLabel("最新版本：获取中...")
-        self.lbl_latest_version.setTextColor(QColor(128, 128, 128))
+        self.lbl_latest_version.setObjectName("settingDetailLabel")
         self.lbl_latest_version.setWordWrap(True)
 
         v.addSpacing(4)
@@ -3666,6 +3872,18 @@ class SettingPage(ScrollArea):
                 "开机自启",
                 "开启后，启动 Windows 时会自动启动本软件，无需手动打开软件",
                 self.switch_auto_start
+            ),
+            self._make_setting_row(
+                FIF.BRUSH,
+                "主题样式",
+                "可切换为跟随系统、浅色或深色，修改后立即生效",
+                self.cb_theme_mode
+            ),
+            self._make_setting_row(
+                FIF.ALIGNMENT,
+                "侧边栏样式",
+                "横向：图标在左文字在右；纵向：图标在上文字在下，修改后立即生效",
+                self.cb_sidebar_style
             ),
             self._make_setting_row(
                 FIF.SYNC,
@@ -3730,56 +3948,26 @@ class SettingPage(ScrollArea):
 
         self._refresh_config_dir_text()
         v.addStretch()
+        qconfig.themeChanged.connect(self._apply_setting_style)
+        qconfig.themeChangedFinished.connect(self._apply_setting_style)
 
     def _apply_setting_style(self):
-        if isDarkTheme():
-            self.view.setStyleSheet("""
-                CardWidget#settingGroup {
-                    background: rgba(24, 24, 24, 0.82);
-                    border: 1px solid rgba(255, 255, 255, 0.05);
-                    border-radius: 12px;
-                }
-                QWidget#settingRow {
-                    background: transparent;
-                    border-radius: 8px;
-                }
-                QWidget#settingRow:hover {
-                    background: rgba(255, 255, 255, 0.03);
-                }
-                QWidget#settingIconTile {
-                    background: transparent;
-                    border: none;
-                }
-                QWidget#settingDivider {
-                    background: rgba(255, 255, 255, 0.08);
-                    min-height: 1px;
-                    max-height: 1px;
-                }
-            """)
-        else:
-            self.view.setStyleSheet("""
-                CardWidget#settingGroup {
-                    background: rgba(255, 255, 255, 0.84);
-                    border: 1px solid rgba(0, 0, 0, 0.06);
-                    border-radius: 12px;
-                }
-                QWidget#settingRow {
-                    background: transparent;
-                    border-radius: 8px;
-                }
-                QWidget#settingRow:hover {
-                    background: rgba(0, 0, 0, 0.03);
-                }
-                QWidget#settingIconTile {
-                    background: transparent;
-                    border: none;
-                }
-                QWidget#settingDivider {
-                    background: rgba(0, 0, 0, 0.07);
-                    min-height: 1px;
-                    max-height: 1px;
-                }
-            """)
+        self.viewport().setStyleSheet("background: transparent; border: none;")
+        self.view.setStyleSheet("background: transparent;")
+
+        text_color = QColor(210, 210, 210, 210) if isDarkTheme() else QColor(128, 128, 128)
+        section_color = QColor(190, 190, 190, 220) if isDarkTheme() else QColor(128, 128, 128)
+        divider_color = "rgba(255, 255, 255, 0.08)" if isDarkTheme() else "rgba(0, 0, 0, 0.07)"
+
+        for label in self.view.findChildren(CaptionLabel):
+            name = label.objectName()
+            if name == "settingSectionLabel":
+                label.setTextColor(section_color)
+            elif name in {"settingTopHint", "settingDescLabel", "settingDetailLabel"}:
+                label.setTextColor(text_color)
+
+        for divider in self.view.findChildren(QWidget, "settingDivider"):
+            divider.setStyleSheet(f"background: {divider_color};")
 
     def _style_action_control(self, widget, width=None):
         widget.setFixedHeight(32)
@@ -3795,7 +3983,7 @@ class SettingPage(ScrollArea):
     def _make_section_label(self, text):
         lbl = CaptionLabel(text)
         setFont(lbl, 12, QFont.Weight.Medium)
-        lbl.setTextColor(QColor(128, 128, 128))
+        lbl.setObjectName("settingSectionLabel")
         return lbl
 
     def _make_group_card(self, rows):
@@ -3851,7 +4039,7 @@ class SettingPage(ScrollArea):
         if desc:
             desc_lbl = CaptionLabel(str(desc))
             desc_lbl.setWordWrap(True)
-            desc_lbl.setTextColor(QColor(128, 128, 128))
+            desc_lbl.setObjectName("settingDescLabel")
             text_col.addWidget(desc_lbl)
         if detail_widget is not None:
             text_col.addSpacing(2)
@@ -3881,6 +4069,20 @@ class SettingPage(ScrollArea):
         self.switch_auto_start.setChecked(not is_checked)
         self.switch_auto_start.blockSignals(False)
         InfoBar.error("更新失败", msg, parent=self.main_win)
+
+    def _on_sidebar_style_changed(self, _):
+        style = "horizontal" if self.cb_sidebar_style.currentIndex() == 0 else "vertical"
+        self.main_win.global_settings["sidebar_style"] = style
+        self.main_win.save_global_settings()
+        self.main_win.apply_sidebar_style(style)
+        InfoBar.success("已更新", f"侧边栏已切换为{SIDEBAR_STYLE_LABELS.get(style, '当前')}样式", parent=self.main_win)
+
+    def _on_theme_mode_changed(self, _):
+        mode = {0: "auto", 1: "light", 2: "dark"}.get(self.cb_theme_mode.currentIndex(), "auto")
+        self.main_win.global_settings["theme_mode"] = mode
+        self.main_win.save_global_settings()
+        self.main_win.apply_theme_mode()
+        InfoBar.success("已更新", f"主题已切换为{THEME_MODE_LABELS.get(mode, '当前')}模式", parent=self.main_win)
 
     def _refresh_config_dir_text(self):
         cur_dir = self.main_win.config_dir
@@ -3961,6 +4163,9 @@ class SettingPage(ScrollArea):
                     defaults = [t for t in defaults if t]
                     self.main_win.targets.extend(defaults)
                     self.main_win.builtin_rule_keys = {make_rule_key(t[0], t[1], t[2], t[6]) for t in defaults}
+
+                if hasattr(self.main_win, "pg_clean"):
+                    self.main_win.pg_clean.estimated_sizes.clear()
                 
                 # 重绘常规清理表格
                 self.main_win.pg_clean.reload_table()
@@ -4033,7 +4238,8 @@ class CleanPage(ScrollArea):
         
         self.tbl.setColumnWidth(0, 36); self.tbl.setColumnWidth(1, 150); self.tbl.setColumnWidth(2, 400); self.tbl.setColumnWidth(3, 200); self.tbl.setColumnWidth(4, 85)
         self.tbl.setIconSize(QSize(24, 24))
-        style_table(self.tbl); v.addWidget(self.tbl, 1)
+        style_table(self.tbl)
+        v.addWidget(self.tbl, 1)
 
         br=QHBoxLayout(); br.setSpacing(8)
         b1=PushButton(FIF.UNIT,"估算"); b1.setFixedHeight(30); b1.clicked.connect(self.do_est); br.addWidget(b1)
@@ -4043,11 +4249,29 @@ class CleanPage(ScrollArea):
         bc=PrimaryPushButton(FIF.DELETE,"开始清理"); bc.setFixedHeight(30); bc.clicked.connect(self.do_clean); br.addWidget(bc)
         bs=PushButton(FIF.CANCEL,"停止"); bs.setFixedHeight(30); bs.clicked.connect(lambda:self.stop.set()); br.addWidget(bs); v.addLayout(br)
 
-        pr=QHBoxLayout(); self.pb=ProgressBar(); self.pb.setRange(0,100); self.pb.setValue(0); self.pb.setFixedHeight(3)
-        pr.addWidget(self.pb,1); self.sl=CaptionLabel("就绪"); pr.addWidget(self.sl); v.addLayout(pr)
-        self.log=TextEdit(); self.log.setReadOnly(True); self.log.setMaximumHeight(120); self.log.setFont(QFont("Consolas",9)); self.log.setPlaceholderText("日志..."); v.addWidget(self.log)
+        self.footer = PageFooterWidget()
+        v.addWidget(self.footer)
+
+    @property
+    def pb(self): return self.footer.pb
+    @property
+    def sl(self): return self.footer.sl
+    @property
+    def log(self): return self.footer.log
+
+    def _prune_estimated_sizes(self):
+        with self._targets_lock:
+            valid_keys = {
+                self._rule_cache_key(entry)
+                for entry in self.targets
+                if entry
+            }
+        stale_keys = [key for key in list(self.estimated_sizes.keys()) if key not in valid_keys]
+        for key in stale_keys:
+            self.estimated_sizes.pop(key, None)
 
     def reload_table(self):
+        self._prune_estimated_sizes()
         self.tbl.setRowCount(0)
         display_entries = self._get_display_entries()
         self.tbl.setRowCount(len(display_entries))
@@ -4101,20 +4325,8 @@ class CleanPage(ScrollArea):
             self.tbl.setRowHidden(row, not matched)
 
     def toggle_sel_all(self):
-        rows = [r for r in range(self.tbl.rowCount()) if not self.tbl.isRowHidden(r)]
-        if not rows: return
-        all_checked = True
-        for r in rows:
-            if not is_row_checked(self.tbl, r):
-                all_checked = False; break
-        new_state = not all_checked
-        for r in rows: set_row_checked(self.tbl, r, new_state)
+        toggle_select_all(self.tbl, self.btn_sel_all)
         self._sync()
-        
-        if new_state:
-            self.btn_sel_all.setText("取消全选"); self.btn_sel_all.setIcon(FIF.CLOSE)
-        else:
-            self.btn_sel_all.setText("全选"); self.btn_sel_all.setIcon(FIF.ACCEPT)
 
     def _sync(self):
         new_targets = []
@@ -4495,6 +4707,7 @@ class CleanPage(ScrollArea):
 class LeftoversDialog(MessageBoxBase):
     def __init__(self, parent, app_name, publisher, install_dir, uninst_reg):
         super().__init__(parent)
+        self.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose, True)
         self.app_name = app_name
         self.publisher = publisher
         self.install_dir = install_dir
@@ -4569,6 +4782,8 @@ class LeftoversDialog(MessageBoxBase):
             display_title = f"[高风险] {title}"
 
         child = QTreeWidgetItem(parent_item, [display_title, " | ".join(part for part in detail_parts if part)])
+        child.setToolTip(0, display_title)
+        child.setToolTip(1, payload.get("path", "") or " | ".join(part for part in detail_parts if part))
         if protection["tier"] == "blocked":
             child.setFlags(child.flags() & ~Qt.ItemFlag.ItemIsUserCheckable)
         else:
@@ -4745,7 +4960,8 @@ class UninstallPage(ScrollArea):
         self.tbl.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers); self.tbl.horizontalHeader().setStretchLastSection(True)
         self.tbl.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu); self.tbl.customContextMenuRequested.connect(lambda p: make_ctx(self,self.tbl,p,5))
         self.tbl.setColumnWidth(0, 36); self.tbl.setColumnWidth(1, 70); self.tbl.setColumnWidth(2, 245); self.tbl.setColumnWidth(3, 100); self.tbl.setColumnWidth(4, 180); self.tbl.setColumnWidth(5, 300); self.tbl.setColumnHidden(6, True)
-        style_table(self.tbl); v.addWidget(self.tbl, 1)
+        style_table(self.tbl)
+        v.addWidget(self.tbl, 1)
 
         br=QHBoxLayout(); br.setSpacing(8)
         b1=PushButton(FIF.SYNC,"刷新列表"); b1.setFixedHeight(30); b1.clicked.connect(self.do_scan); br.addWidget(b1)
@@ -4754,9 +4970,15 @@ class UninstallPage(ScrollArea):
         b3=PrimaryPushButton(FIF.DELETE,"强力卸载"); b3.setFixedHeight(30); b3.clicked.connect(self.do_force_uninstall); br.addWidget(b3)
         v.addLayout(br)
 
-        pg=QHBoxLayout(); self.pb=ProgressBar(); self.pb.setRange(0,100); self.pb.setValue(0); self.pb.setFixedHeight(3)
-        pg.addWidget(self.pb,1); self.sl=CaptionLabel("就绪"); pg.addWidget(self.sl); v.addLayout(pg)
-        self.log=TextEdit(); self.log.setReadOnly(True); self.log.setMaximumHeight(120); self.log.setFont(QFont("Consolas",9)); self.log.setPlaceholderText("日志..."); v.addWidget(self.log)
+        self.footer = PageFooterWidget()
+        v.addWidget(self.footer)
+
+    @property
+    def pb(self): return self.footer.pb
+    @property
+    def sl(self): return self.footer.sl
+    @property
+    def log(self): return self.footer.log
 
     def _filter_table(self, text):
         search_str = text.lower()
@@ -5130,16 +5352,10 @@ class BigFilePage(ScrollArea):
         title_row.insertWidget(2, self.lbl_disk, 0, Qt.AlignmentFlag.AlignBottom)
         v.addLayout(title_row)
         
-        self.drives = get_available_drives(); self.drive_actions = []; self.drive_states = {d: (True if d.startswith("C") else False) for d in self.drives}; self._menu_last_close = 0
+        self.drive_sel = DriveSelector(default_checked={"C:\\"}, parent=self)
         dl = QHBoxLayout(); dl.setSpacing(10); dl.addWidget(StrongBodyLabel("选择范围:"))
-        self.btn_drives = LeftAlignedPushButton("磁盘: C:\\"); self.menu_drives = RoundMenu(parent=self)
-        self.btn_drives.setMinimumWidth(220)
-        for d in self.drives:
-            action = Action(d); action.setData(d); action.triggered.connect(lambda checked=False, a=action: self._toggle_drive(a))
-            self.menu_drives.addAction(action); self.drive_actions.append(action)
-        self.btn_drives.clicked.connect(self._show_drives_menu); dl.addWidget(self.btn_drives)
+        dl.addWidget(self.drive_sel)
         dl.addStretch(); v.addLayout(dl)
-        self._update_drive_btn_text()
 
         self.sig.disk_ready.connect(self._on_disk_ready)
 
@@ -5160,7 +5376,8 @@ class BigFilePage(ScrollArea):
         self.tbl.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers); self.tbl.horizontalHeader().setStretchLastSection(True)
         self.tbl.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu); self.tbl.customContextMenuRequested.connect(lambda p: make_ctx(self,self.tbl,p,3))
         self.tbl.setColumnWidth(0, 36); self.tbl.setColumnWidth(1, 200); self.tbl.setColumnWidth(2, 120); self.tbl.setColumnWidth(3, 760)
-        style_table(self.tbl); v.addWidget(self.tbl, 1)
+        style_table(self.tbl)
+        v.addWidget(self.tbl, 1)
 
         br=QHBoxLayout(); br.setSpacing(8)
         b1=PrimaryPushButton(FIF.SEARCH,"扫描"); b1.setFixedHeight(30); b1.clicked.connect(self.do_scan); br.addWidget(b1)
@@ -5172,41 +5389,18 @@ class BigFilePage(ScrollArea):
         b4=PushButton(FIF.CANCEL,"停止"); b4.setFixedHeight(30); b4.clicked.connect(self._stop_current); br.addWidget(b4)
         br.addStretch(); v.addLayout(br)
 
-        pg=QHBoxLayout(); self.pb=ProgressBar(); self.pb.setRange(0,100); self.pb.setValue(0); self.pb.setFixedHeight(3)
-        pg.addWidget(self.pb,1); self.sl=CaptionLabel("就绪"); pg.addWidget(self.sl); v.addLayout(pg)
-        self.log=TextEdit(); self.log.setReadOnly(True); self.log.setMaximumHeight(120); self.log.setFont(QFont("Consolas",9)); self.log.setPlaceholderText("日志..."); v.addWidget(self.log)
+        self.footer = PageFooterWidget()
+        v.addWidget(self.footer)
+
+    @property
+    def pb(self): return self.footer.pb
+    @property
+    def sl(self): return self.footer.sl
+    @property
+    def log(self): return self.footer.log
 
     def toggle_sel_all(self):
-        rc = self.tbl.rowCount()
-        if rc == 0: return
-        all_checked = True
-        for r in range(rc):
-            if not is_row_checked(self.tbl, r):
-                all_checked = False; break
-        new_state = not all_checked
-        for r in range(rc): set_row_checked(self.tbl, r, new_state)
-            
-        if new_state:
-            self.btn_sel_all.setText("取消全选"); self.btn_sel_all.setIcon(FIF.CLOSE)
-        else:
-            self.btn_sel_all.setText("全选"); self.btn_sel_all.setIcon(FIF.ACCEPT)
-
-    def _show_drives_menu(self):
-        if time.time() - self._menu_last_close < 0.2: return
-        self.menu_drives.exec(self.btn_drives.mapToGlobal(QPoint(0, self.btn_drives.height() + 2))); self._menu_last_close = time.time()
-    def _toggle_drive(self, action):
-        d = action.data(); self.drive_states[d] = not self.drive_states[d]; self._update_drive_btn_text()
-    def _update_drive_btn_text(self):
-        sel = [a.data() for a in self.drive_actions if self.drive_states[a.data()]]
-        for a in self.drive_actions: a.setText(f"{a.data()} √" if self.drive_states[a.data()] else a.data())
-        if not sel:
-            txt = "磁盘: (未选择)"
-        elif len(sel) == 1:
-            txt = f"磁盘: {sel[0]}"
-        else:
-            txt = f"磁盘: {sel[0]} 等 {len(sel)} 个"
-        self.btn_drives.setText(txt)
-        self.btn_drives.setToolTip(f"已选磁盘: {', '.join(sel)}" if sel else "未选择磁盘")
+        toggle_select_all(self.tbl, self.btn_sel_all, check_hidden=True)
 
     def _on_disk_ready(self, dtype, threads): self._disk_type = dtype; self._disk_threads = threads; self.lbl_disk.setText(f"类型：{dtype}  线程：{threads}")
 
@@ -5229,7 +5423,7 @@ class BigFilePage(ScrollArea):
     def _scan_w(self):
         t0 = time.time()
         mb=self.sp_mb.value(); mx=self.sp_mx.value()
-        roots = [d for d, state in self.drive_states.items() if state]
+        roots = self.drive_sel.selected_drives()
         if not roots:
             self.sig.big_done.emit("warning", "错误：未选择磁盘")
             return
@@ -5287,18 +5481,8 @@ class MoreCleanPage(ScrollArea):
         self.cb_mode.setFixedWidth(200); self.cb_mode.currentIndexChanged.connect(self._on_mode_change)
         dl.addWidget(StrongBodyLabel("扫描类型:")); dl.addWidget(self.cb_mode); dl.addSpacing(20)
 
-        self.drives = get_available_drives()
-        self.drive_actions = []
-        self.drive_states = {d: False for d in self.drives}
-        self._menu_last_close = 0
-        self.btn_drives = LeftAlignedPushButton("磁盘: (未选择)"); self.menu_drives = RoundMenu(parent=self)
-        self.btn_drives.setMinimumWidth(220)
-        for d in self.drives:
-            action = Action(d); action.setData(d); action.triggered.connect(lambda checked=False, a=action: self._toggle_drive(a))
-            self.menu_drives.addAction(action); self.drive_actions.append(action)
-        self.btn_drives.clicked.connect(self._show_drives_menu)
-        
-        self.lbl_disk_req = StrongBodyLabel("选择范围:"); dl.addWidget(self.lbl_disk_req); dl.addWidget(self.btn_drives); dl.addStretch(); v.addLayout(dl)
+        self.drive_sel = DriveSelector(parent=self)
+        self.lbl_disk_req = StrongBodyLabel("选择范围:"); dl.addWidget(self.lbl_disk_req); dl.addWidget(self.drive_sel); dl.addStretch(); v.addLayout(dl)
 
         pr = QHBoxLayout(); pr.setSpacing(10)
         self.chk_perm=CheckBox("永久删除(文件不进回收站)"); self.chk_perm.setChecked(True); pr.addWidget(self.chk_perm)
@@ -5316,7 +5500,8 @@ class MoreCleanPage(ScrollArea):
         self.tbl.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers); self.tbl.horizontalHeader().setStretchLastSection(True)
         self.tbl.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu); self.tbl.customContextMenuRequested.connect(lambda p: make_ctx(self,self.tbl,p,4))
         self.tbl.setColumnWidth(0, 36); self.tbl.setColumnWidth(1, 100); self.tbl.setColumnWidth(2, 180); self.tbl.setColumnWidth(3, 140); self.tbl.setColumnWidth(4, 550)
-        style_table(self.tbl); v.addWidget(self.tbl, 1)
+        style_table(self.tbl)
+        v.addWidget(self.tbl, 1)
 
         br=QHBoxLayout(); br.setSpacing(8)
         b1=PrimaryPushButton(FIF.SEARCH,"开始扫描"); b1.setFixedHeight(30); b1.clicked.connect(self.do_scan); br.addWidget(b1)
@@ -5327,63 +5512,37 @@ class MoreCleanPage(ScrollArea):
         b2=PushButton(FIF.DELETE,"清理已勾选"); b2.setFixedHeight(30); b2.clicked.connect(self.do_del); br.addWidget(b2)
         b3=PushButton(FIF.CANCEL,"停止"); b3.setFixedHeight(30); b3.clicked.connect(self._stop_current); br.addWidget(b3); br.addStretch(); v.addLayout(br)
 
-        pg=QHBoxLayout(); self.pb=ProgressBar(); self.pb.setRange(0,100); self.pb.setValue(0); self.pb.setFixedHeight(3)
-        pg.addWidget(self.pb,1); self.sl=CaptionLabel("就绪"); pg.addWidget(self.sl); v.addLayout(pg)
-        
-        self.log=TextEdit(); self.log.setReadOnly(True); self.log.setMaximumHeight(120); self.log.setFont(QFont("Consolas",9)); self.log.setPlaceholderText("日志..."); v.addWidget(self.log)
+        self.footer = PageFooterWidget()
+        v.addWidget(self.footer)
+
+    @property
+    def pb(self): return self.footer.pb
+    @property
+    def sl(self): return self.footer.sl
+    @property
+    def log(self): return self.footer.log
 
     def toggle_sel_all(self):
-        rc = self.tbl.rowCount()
-        if rc == 0: return
-        all_checked = True
-        for r in range(rc):
-            if not is_row_checked(self.tbl, r):
-                all_checked = False; break
-        new_state = not all_checked
-        for r in range(rc): set_row_checked(self.tbl, r, new_state)
-            
-        if new_state:
-            self.btn_sel_all.setText("取消全选"); self.btn_sel_all.setIcon(FIF.CLOSE)
-        else:
-            self.btn_sel_all.setText("全选"); self.btn_sel_all.setIcon(FIF.ACCEPT)
+        toggle_select_all(self.tbl, self.btn_sel_all, check_hidden=True)
 
     def _on_mode_change(self):
         mode_idx = self.cb_mode.currentIndex()
         is_reg = mode_idx in (3, 4)
-        self.btn_drives.setVisible(not is_reg); self.lbl_disk_req.setVisible(not is_reg)
+        self.drive_sel.setVisible(not is_reg); self.lbl_disk_req.setVisible(not is_reg)
         self.btn_restore_assoc.setVisible(mode_idx == 4)
         hide_c_drive = mode_idx == 0
-        for d in self.drives:
-            if hide_c_drive and d.upper().startswith("C"):
-                self.drive_states[d] = False
-        for a in self.drive_actions:
-            is_c_drive = str(a.data()).upper().startswith("C")
-            a.setVisible(not (hide_c_drive and is_c_drive))
-        self._update_drive_btn_text()
-
-    def _show_drives_menu(self):
-        if time.time() - self._menu_last_close < 0.2: return
-        self.menu_drives.exec(self.btn_drives.mapToGlobal(QPoint(0, self.btn_drives.height() + 2))); self._menu_last_close = time.time()
-    def _toggle_drive(self, action):
-        d = action.data(); self.drive_states[d] = not self.drive_states[d]; self._update_drive_btn_text()
-    def _update_drive_btn_text(self):
-        visible_actions = [a for a in self.drive_actions if a.isVisible()]
-        sel = [a.data() for a in visible_actions if self.drive_states[a.data()]]
-        for a in self.drive_actions: a.setText(f"{a.data()} √" if self.drive_states[a.data()] else a.data())
-        if not sel:
-            txt = "磁盘: (未选择)"
-        elif len(sel) == 1:
-            txt = f"磁盘: {sel[0]}"
-        else:
-            txt = f"磁盘: {sel[0]} 等 {len(sel)} 个"
-        self.btn_drives.setText(txt)
-        self.btn_drives.setToolTip(f"已选磁盘: {', '.join(sel)}" if sel else "未选择磁盘")
+        for d in self.drive_sel.drives:
+            is_c = d.upper().startswith("C")
+            if hide_c_drive and is_c:
+                self.drive_sel.set_drive_visible(d, False)
+            elif not is_reg:
+                self.drive_sel.set_drive_visible(d, not (hide_c_drive and is_c))
 
     def _stop_current(self):
         self.stop.set()
 
     def do_scan(self):
-        idx = self.cb_mode.currentIndex(); roots = [d for d, state in self.drive_states.items() if state]
+        idx = self.cb_mode.currentIndex(); roots = self.drive_sel.selected_drives()
         if idx not in (3, 4) and not roots: self.sig.more_done.emit("错误：未选择磁盘"); return
         self.stop.clear(); self.sig.more_clr.emit(); self.sig.more_log.emit(f"开始 {self.cb_mode.currentText()}...")
         
@@ -5874,10 +6033,12 @@ class MoreCleanPage(ScrollArea):
         self.sig.more_done.emit(f"清理完成：成功 {ok}，失败 {fl}，耗时 {time.time()-t0:.1f} 秒")
 
 
+
+
 # ══════════════════════════════════════════════════════════
 #  主窗口
 # ══════════════════════════════════════════════════════════
-class MainWindow(FluentWindow):
+class MainWindow(MSFluentWindow):
     def __init__(self):
         super().__init__()
 
@@ -5893,6 +6054,8 @@ class MainWindow(FluentWindow):
         self.global_settings = {
             "auto_save": True,
             "auto_start": False,
+            "theme_mode": "auto",
+            "sidebar_style": "vertical",
             "update_channel": "stable",
             "protect_builtin_rules": True,
             "deleted_builtin_rules": []
@@ -5907,6 +6070,7 @@ class MainWindow(FluentWindow):
             self.global_settings["auto_start"] = is_app_auto_start_enabled()
         except Exception as e:
             log_background_error("读取开机自启状态失败", e)
+        self.global_settings["theme_mode"] = normalize_theme_mode(self.global_settings.get("theme_mode", "auto"))
 
         self.targets = [parse_rule_entry(t) for t in default_clean_targets()]
         self.targets = [t for t in self.targets if t]
@@ -5970,6 +6134,8 @@ class MainWindow(FluentWindow):
         self.pg_setting = SettingPage(self, self)
         self._update_lock = threading.Lock()
         self._update_checking = False
+        self._nav_connected = False
+        self.apply_theme_mode()
 
         self._init_nav(); self._init_win(); self._conn()
         threading.Thread(target=self._async_detect, daemon=True).start()
@@ -5977,6 +6143,50 @@ class MainWindow(FluentWindow):
         self._pending_legacy_migration = self._should_offer_legacy_migration()
         if self._pending_legacy_migration:
             QTimer.singleShot(800, self._prompt_legacy_config_migration)
+
+    def apply_theme_mode(self):
+        mode = normalize_theme_mode(self.global_settings.get("theme_mode", "auto"))
+        self.global_settings["theme_mode"] = mode
+        setTheme(resolve_theme_enum(mode))
+        if hasattr(self, "pg_setting"):
+            try:
+                self.pg_setting._apply_setting_style()
+                QTimer.singleShot(0, self.pg_setting._apply_setting_style)
+            except Exception:
+                pass
+        for widget in (self, getattr(self, "pg_setting", None), getattr(self, "pg_clean", None),
+                       getattr(self, "pg_rule_store", None), getattr(self, "pg_schedule", None),
+                       getattr(self, "pg_big", None), getattr(self, "pg_uninstall", None),
+                       getattr(self, "pg_more", None)):
+            if widget is None:
+                continue
+            try:
+                widget.update()
+                if hasattr(widget, "viewport") and callable(getattr(widget, "viewport")):
+                    viewport = widget.viewport()
+                    if viewport is not None:
+                        viewport.update()
+            except Exception:
+                pass
+        self.titleBar.raise_()
+
+    def apply_sidebar_style(self, style=None):
+        if style is not None:
+            style = str(style).strip().lower()
+            if style in SIDEBAR_STYLE_LABELS:
+                self.global_settings["sidebar_style"] = style
+
+        current_page = self.stackedWidget.currentWidget()
+        current_route = current_page.objectName() if isinstance(current_page, QWidget) else ""
+        self._setup_navigation_widget(force_rebuild=True)
+        self._register_nav_items()
+        if current_route:
+            try:
+                self.navigationInterface.setCurrentItem(current_route)
+            except Exception:
+                pass
+        self.titleBar.raise_()
+        self.update()
 
     def _load_config_dir(self):
         default_dir = self.default_config_dir
@@ -6244,21 +6454,123 @@ class MainWindow(FluentWindow):
                 log_background_error("关闭窗口时自动保存失败", e)
         super().closeEvent(event)
 
+    def _setup_navigation_widget(self, force_rebuild=False):
+        style = str(self.global_settings.get("sidebar_style", "vertical")).strip().lower()
+        if style not in SIDEBAR_STYLE_LABELS:
+            style = "vertical"
+        self._sidebar_style = style
+
+        current_nav = getattr(self, "navigationInterface", None)
+        need_horizontal = style == "horizontal"
+        is_horizontal_nav = isinstance(current_nav, NavigationInterface) and not isinstance(current_nav, NavigationBar)
+        is_vertical_nav = isinstance(current_nav, NavigationBar)
+
+        if not force_rebuild:
+            if need_horizontal and is_horizontal_nav:
+                current_nav.setExpandWidth(200)
+                current_nav.setCollapsible(True)
+                return
+            if not need_horizontal and is_vertical_nav:
+                current_nav.setFixedWidth(76)
+                return
+
+        if current_nav is not None:
+            try:
+                self.hBoxLayout.removeWidget(current_nav)
+            except Exception:
+                pass
+            current_nav.hide()
+            current_nav.deleteLater()
+
+        if need_horizontal:
+            self.navigationInterface = NavigationInterface(self, showReturnButton=True, collapsible=True)
+            self.navigationInterface.setExpandWidth(200)
+            self.navigationInterface.setCollapsible(True)
+            self.navigationInterface.displayModeChanged.connect(self.titleBar.raise_)
+        else:
+            self.navigationInterface = NavigationBar(self)
+            self.navigationInterface.setFixedWidth(76)
+
+        self.hBoxLayout.insertWidget(0, self.navigationInterface)
+        self.titleBar.raise_()
+
+    def _register_nav_items(self):
+        self._add_nav_page(self.pg_clean, FIF.BROOM, "常规清理")
+        self._add_nav_page(self.pg_rule_store, FIF.DOCUMENT, "规则商店")
+        self._add_nav_page(self.pg_schedule, FIF.SYNC, "定时任务")
+        self._add_nav_page(self.pg_big, FIF.ZOOM, "大文件扫描")
+        self._add_nav_page(self.pg_uninstall, FIF.APPLICATION, "应用强力卸载")
+        self._add_nav_page(self.pg_more, FIF.MORE, "更多清理")
+        self._add_nav_page(self.pg_setting, FIF.SETTING, "设置", position=NavigationItemPosition.BOTTOM)
+        self._add_nav_action("about", FIF.INFO, "关于", self._about, position=NavigationItemPosition.BOTTOM)
+
+    def _add_nav_page(self, interface, icon, text, position=NavigationItemPosition.TOP, isTransparent=False):
+        if not interface.objectName():
+            raise ValueError("The object name of `interface` can't be empty string.")
+
+        interface.setProperty("isStackedTransparent", isTransparent)
+        if self.stackedWidget.indexOf(interface) < 0:
+            self.stackedWidget.addWidget(interface)
+
+        route_key = interface.objectName()
+        on_click = lambda checked=False, page=interface: self.switchTo(page)
+
+        if isinstance(self.navigationInterface, NavigationBar):
+            self.navigationInterface.addItem(
+                routeKey=route_key,
+                icon=icon,
+                text=text,
+                onClick=on_click,
+                position=position
+            )
+        else:
+            self.navigationInterface.addItem(
+                routeKey=route_key,
+                icon=icon,
+                text=text,
+                onClick=on_click,
+                position=position,
+                tooltip=text
+            )
+
+        if not self._nav_connected:
+            self.stackedWidget.currentChanged.connect(self._onCurrentInterfaceChanged)
+            self._nav_connected = True
+
+        if self.stackedWidget.count() == 1:
+            self.navigationInterface.setCurrentItem(route_key)
+            qrouter.setDefaultRouteKey(self.stackedWidget, route_key)
+
+        self._updateStackedBackground()
+
+    def _add_nav_action(self, route_key, icon, text, on_click, position=NavigationItemPosition.BOTTOM):
+        callback = (lambda checked=False: on_click())
+        if isinstance(self.navigationInterface, NavigationBar):
+            self.navigationInterface.addItem(
+                routeKey=route_key,
+                icon=icon,
+                text=text,
+                onClick=callback,
+                selectable=False,
+                position=position
+            )
+        else:
+            self.navigationInterface.addItem(
+                routeKey=route_key,
+                icon=icon,
+                text=text,
+                onClick=callback,
+                selectable=False,
+                position=position,
+                tooltip=text
+            )
+
     def _init_nav(self):
-        self.navigationInterface.setExpandWidth(200); self.navigationInterface.setCollapsible(True)
-        self.addSubInterface(self.pg_clean, FIF.BROOM, "常规清理")
-        self.addSubInterface(self.pg_rule_store, FIF.DOCUMENT, "规则商店")
-        self.addSubInterface(self.pg_schedule, FIF.SYNC, "定时任务")
-        self.addSubInterface(self.pg_big,   FIF.ZOOM,  "大文件扫描")
-        self.addSubInterface(self.pg_uninstall, FIF.APPLICATION, "应用强力卸载")
-        self.addSubInterface(self.pg_more,  FIF.MORE,  "更多清理")
-        
-        self.navigationInterface.addSeparator()
-        self.addSubInterface(self.pg_setting, FIF.SETTING, "设置", position=NavigationItemPosition.BOTTOM)
-        self.navigationInterface.addItem(routeKey="about", icon=FIF.INFO, text="关于", onClick=self._about, selectable=False, position=NavigationItemPosition.BOTTOM)
+        self._setup_navigation_widget()
+        self._register_nav_items()
 
     def _init_win(self):
-        self.resize(1121, 646); self.setMinimumSize(874, 473); self.setWindowTitle(f"C盘强力清理工具 v{CURRENT_VERSION}")
+        self.resize(1200, 700); self.setMinimumSize(940, 560); self.setWindowTitle(f"C盘强力清理工具 v{CURRENT_VERSION}")
         icon_path = resource_path("icon.ico")
         if os.path.exists(icon_path): self.setWindowIcon(QIcon(icon_path))
         scr=QApplication.primaryScreen()
@@ -6379,6 +6691,9 @@ class MainWindow(FluentWindow):
 
     def _ts(self): return time.strftime("%H:%M:%S")
 
+    def _request_memory_trim(self, force=False):
+        threading.Thread(target=trim_process_memory, args=(force,), daemon=True).start()
+
     def _page_log(self, page, t):
         line=f"[{self._ts()}] {t}"
         append_session_log_line(line)
@@ -6391,6 +6706,8 @@ class MainWindow(FluentWindow):
         else:
             page.pb.setRange(0, max(1, m))
             page.pb.setValue(v)
+            pct = int(v * 100 / max(1, m))
+            page.footer.set_status(page.sl.text().split("  ")[0], pct)
 
     def _est(self, idx, val):
         try:
@@ -6405,6 +6722,8 @@ class MainWindow(FluentWindow):
         else:
             self.pg_big.pb.setRange(0, max(1, m))
             self.pg_big.pb.setValue(v)
+            pct = int(v * 100 / max(1, m))
+            self.pg_big.footer.set_status(self.pg_big.sl.text().split("  ")[0], pct)
 
     def _big_scan_count(self, scanned):
         self.pg_big.sl.setText(f"已扫描 {max(0, int(scanned))} 个文件")
@@ -6421,6 +6740,7 @@ class MainWindow(FluentWindow):
             "error": InfoBar.error
         }.get(level, InfoBar.success)
         bar_fn("完成" if level == "success" else "提示", msg, orient=Qt.Orientation.Horizontal, isClosable=True, position=InfoBarPosition.TOP, duration=4000, parent=self)
+        self._request_memory_trim(force=True)
 
     def _finish_page(self, page, msg, title="完成"):
         page.pb.setRange(0, 100)
@@ -6428,6 +6748,7 @@ class MainWindow(FluentWindow):
         page.sl.setText("完成")
         append_capped_log(page.log, f"[{self._ts()}] [完成] {msg}")
         InfoBar.success(title, msg, orient=Qt.Orientation.Horizontal, isClosable=True, position=InfoBarPosition.TOP, duration=4000, parent=self)
+        self._request_memory_trim(force=True)
 
     def _clean_done(self, msg):
         self.pg_clean.tbl.setDragEnabled(True) 
@@ -6574,7 +6895,9 @@ def main():
         if relaunch_as_admin():
             sys.exit(0)
         sys.exit(1)
-    app = QApplication(sys.argv); setFontFamilies(["微软雅黑"]); setTheme(Theme.AUTO); setThemeColor("#0078d4")
+    runtime_settings = load_runtime_global_settings()
+    initial_theme_mode = normalize_theme_mode(runtime_settings.get("theme_mode", "auto"))
+    app = QApplication(sys.argv); setFontFamilies(["微软雅黑"]); setTheme(resolve_theme_enum(initial_theme_mode)); setThemeColor("#0078d4")
     w = MainWindow(); w.show(); sys.exit(app.exec())
 
 if __name__=="__main__": main()
