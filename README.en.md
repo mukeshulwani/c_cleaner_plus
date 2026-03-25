@@ -5,9 +5,8 @@
 <h1 align="center">C Cleaner Plus</h1>
 
 <p align="center">
-  Powerful Windows C Drive Cleaner · Built with Python + Fluent 2 Design
+  Windows cleanup utility · Python + Fluent 2 Design
 </p>
-
 
 <p align="center">
   <a href="https://github.com/Kiowx/c_cleaner_plus/releases">
@@ -17,235 +16,115 @@
     <img src="https://img.shields.io/badge/_Docs-docs.cus.cc.cd-12B7F5?style=flat-square&logo=read-the-docs&logoColor=white" alt="Documentation">
   </a>
   <a href="https://t.me/kyu649">
-    <img src="https://img.shields.io/badge/Telegram-Group-26A5E4?style=flat-square&logo=telegram&logoColor=white" alt="Telegram">
+    <img src="https://img.shields.io/badge/Telegram-Community-26A5E4?style=flat-square&logo=telegram&logoColor=white" alt="Telegram">
   </a>
   <a href="https://qm.qq.com/q/xE1xw9wP7M">
-    <img src="https://img.shields.io/badge/QQ_Group-Join_Us-12B7F5?style=flat-square&logo=tencent-qq&logoColor=white" alt="QQ Group">
+    <img src="https://img.shields.io/badge/QQ Group-Join-12B7F5?style=flat-square&logo=tencent-qq&logoColor=white" alt="QQ Group">
   </a>
 </p>
+
 <p align="center">
   <a href="README.md">简体中文</a> ·
   <a href="README.en.md"><strong>English</strong></a>
 </p>
 
-
 ---
 
-A powerful C drive cleanup tool for Windows that can scan and clean junk files, large files, duplicate files, and system leftovers on the C drive.
+A Windows full-disk cleanup utility covering regular cleanup, large file scanning, advanced cleanup tools, force uninstall, scheduled tasks, and a rule store.  
+Built with **Python + PySide6 + Fluent Widgets**, it provides a GUI, administrator elevation, light/dark themes, switchable sidebar layouts, and remote rule pack import.
 
-This project is built with **Python + Fluent 2 Design**, completely open source and free, designed for the Windows platform. It supports various cleanup modes including regular junk cleanup, large file scanning, duplicate file finding, empty folder cleanup, invalid shortcut cleanup, and registry cleanup. It also provides a GUI interface, automatically requests administrator privileges on startup, recycle bin/permanent deletion options, and more. Easy to operate, suitable for all types of users.
+<img width="1682" height="969" alt="QQ_1772472271177" src="https://picui.ogmua.cn/s1/2026/03/14/69b5379caafa3.webp" />
 
-<img width="1682" height="969" alt="QQ_1772472271177" src="https://github.com/user-attachments/assets/13dbfd3c-58cb-45c7-b11e-4f57edc51743" />
+## Features
 
----
+### Regular Cleanup
 
-## ✨ Features
+- Cleans common targets such as temp files, system logs, thumbnail cache, browser cache, and package manager cache
+- Supports cleanup size estimation
+- Supports selective execution, custom rules, drag sorting, and rule import/export
+- Supports recycle bin deletion and permanent deletion
 
-### 🔹 Regular Cleanup
-- User temporary files (`%TEMP%`)
-- System temporary files (`C:\Windows\Temp`)
-- Windows logs (CBS / DISM)
-- Crash dumps (Minidump / MEMORY.DMP)
-- Thumbnail cache (Explorer)
-- DirectX / NVIDIA Shader Cache / AMD Shader Cache (optional)
-- Browser cache (Edge / Chrome, optional)
-- Frontend (npm / Yarn / pnpm), Backend (Go / Maven / Gradle / Cargo / Composer), and pip / .NET package cache cleanup (optional)
-- Windows Update cache (optional)
+### Large File Scan
 
-Supports:
-- Scan and **get cleanable size**
-- Select items by checkbox to execute
-- Safe items selected by default
-- Custom cleanup rules
+- Supports multi-drive scanning
+- Supports custom minimum file size and result count
+- Supports sorting by size, name, and path
+- Supports selective deletion
 
----
+### Advanced Cleanup
 
-### 🔹 Large File Scanner
-- Scan **large files across multiple partitions**
-- Customizable:
-  - Single/multi disk partition selection for scanning
-  - Minimum file size threshold (MB)
-  - Maximum number of results to display
-- Sort by size
-- Select individually for deletion
+- Duplicate file scan
+- Empty folder scan
+- Invalid shortcut cleanup
+- Uninstall registry cleanup
+- Context menu cleanup
 
-Large file list supports:
-- File name / size / full path display
-- Right-click menu:
-  - Copy path
-  - Open containing folder
-  - Locate in File Explorer
-- Double-click to quickly select
+### Force Uninstall
 
----
+- Supports both standard uninstall and force uninstall
+- Can scan leftovers after standard uninstall
+- Force uninstall can clean files, registry entries, services, and scheduled tasks
+- Includes built-in risk blocking and protection tiers
 
-### 🔹 More Cleanup
-- **Dropdown one-click switch** between multiple advanced cleanup modes
-- Multiple specialized cleanup functions integrated into a unified interface
-- Intelligently hide irrelevant options
+### Scheduled Tasks
 
-#### Duplicate File Finder
-- Uses **three-stage hash algorithm** to accurately locate duplicate files
-  - Stage 1: Quick filter by file size
-  - Stage 2: Partial hash comparison
-  - Stage 3: Full hash confirmation
-- **Smart selection** of redundant copies, keeping original files
-- Supports multi-partition scanning
-- Significantly reduces risk of accidental deletion
+- Supports daily, weekly, hourly, per-minute, and logon triggers
+- Supports custom intervals
+- Can run regular cleanup, empty folder cleanup, invalid shortcut cleanup, uninstall registry cleanup, and standard app uninstall
+- Supports auto start with Windows
 
-#### Empty Folder Scanner
-- **Deep traversal** of specified directories
-- Safely clean empty directories with no actual content
-- Supports custom scan paths
-- Scan results can be previewed and confirmed
+### Rule Store and UI Settings
 
-#### Invalid Shortcut Cleanup
-- Automatically parses `.lnk` shortcut files
-- Finds invalid shortcuts where **target files are missing**
-- Supports Desktop, Start Menu, Quick Launch locations
-- One-click cleanup of invalid links
+- Supports downloading and importing remote rule packs
+- Current rule directions include:
+  - General rules
+  - Chinese apps
+  - Dev tools
+  - AI tools
+  - Media creation tools
+  - Mobile dev tools
+  - 3D / CAD tools
+  - Gaming platforms
+- Supports dark / light / system theme
+- Supports horizontal / vertical sidebar layout
+- Supports update channels and log export
 
-#### Invalid Registry Scanner
-- One-click cleanup of registry leftovers from **uninstalled software**
-- Scans common registry paths:
-  - `HKEY_CURRENT_USER\Software`
-  - `HKEY_LOCAL_MACHINE\SOFTWARE`
-  - Uninstall information leftovers
-- **Automatically hides** irrelevant disk selection module
-- Recommended to create a system restore point before cleanup
+## Requirements
 
-#### Context Menu Cleanup
-- Deep scan of critical system registry locations
-- List and clean excess, invalid, or unwanted context menu extensions
-- Supports recursive deletion, including registry keys with subkeys
+- Windows 10 / Windows 11
+- Python 3.9+
+- Windows only
+- Some features require administrator privileges
 
----
+## Usage
 
-### Powerful Application Uninstall
-Provides two approaches:
+### 1. Download a release
 
-- **Standard Uninstall**
-  Calls the software's built-in uninstaller, continues to deeply scan for leftovers after uninstallation completes
+Download the latest build from [Releases](https://github.com/Kiowx/c_cleaner_plus/releases) and run it directly.  
+If Windows reports insufficient permissions, run it as administrator.
 
-- **Powerful Uninstall**
-  Aggressive removal process for stubborn software
-  Can attempt to unlock processes, services, and drivers
-  Uses system commands to forcefully delete registry entries
-  Forcefully deletes leftover files and directories
-  Can schedule kernel-locked files for deletion after restart
-
----
-
-### Cleanup Modes
-- **Normal Mode**: Deleted files go to Recycle Bin (recoverable)
-- **Power Mode**: Permanent deletion, does not go to Recycle Bin
-  - Enabled by default
-  - Confirmation required before execution
-
----
-
-### Permissions & Security
-- Automatically detects administrator privileges on startup
-- Automatically requests UAC elevation when not running as administrator
-- Optional: Create system restore point before cleanup (requires administrator)
-- Comprehensive deletion warning messages to prevent accidental operations
-
-## 🖥️ System Requirements
-
-| Item | Requirements |
-|------|------|
-| Operating System | Windows 10 / Windows 11 |
-| Python Version | 3.9+ (Recommended 3.10 / 3.11) |
-| Platform Support | Windows only (uses Windows API) |
-| Administrator Privileges | Some features require administrator privileges |
-
----
-
-## 🚀 Usage
-
-### Method 1: Download from Releases (Recommended)
-
-If you don't want to configure the Python environment yourself, **we highly recommend downloading the pre-packaged executable directly**:
-
-**Go to the [Releases](https://github.com/Kiowx/c_cleaner_plus/releases) page to download the latest version:**
-https://github.com/Kiowx/c_cleaner_plus/releases
-
-After downloading:
-1. **Right-click the `.exe` file → Run as administrator**
-2. Follow the interface prompts to scan and clean
-
-> The `exe` files provided in Releases include the runtime environment, no need to install Python separately.
-
----
-
-### Method 2: Run from Source
+### 2. Run from source
 
 ```bash
-# Clone the project
 git clone https://github.com/Kiowx/c_cleaner_plus.git
 cd c_cleaner_plus
-
 pip install -r requirements.txt
-
-# Run as administrator
 python main.py
 ```
----
 
-## 📁 Configuration Files
+## Config and Rules
 
-Common configuration files are located at the following paths on your machine:
-
-* `%LOCALAPPDATA%\cdisk_cleaner_config.json`
-  Used to save regular cleanup checkbox states and drag-sort memory
-
-* `%LOCALAPPDATA%\cdisk_cleaner_custom_rules.json`
-  Used to save custom cleanup rules, independent of interface preferences
-
-* `%LOCALAPPDATA%\cdisk_cleaner_global_settings.json`
-  Used to save global settings, such as auto-save and update channel
-
-* `%TEMP%\cdisk_cleaner_cache.json`
-  Used to save disk type detection cache, can be refreshed with one click in settings page
-
-### General Rules
-* You can use the general [config](https://github.com/Kiowx/c_cleaner_plus/tree/main/config) rules provided by the project
-
-### Custom Rule Format
-
-See details: https://docs.cus.cc.cd/guide/config.html
-
-## Update Channel Configuration
-
-Update channel can be configured in the system settings interface:
-
-| Channel | Description |
-|------|------|
-| **Stable** | Fully tested version, recommended for regular users |
-| **Beta** | Faster updates, may include new features, suitable for early adopters |
-
-# Contributing
-
-## Code Contributions
-
-1. Fork this project
-2. Create a feature branch (`git checkout -b feature/AmazingFeature`)
-3. Commit your changes (`git commit -m 'Add some AmazingFeature'`)
-4. Push to the branch (`git push origin feature/AmazingFeature`)
-5. Open a Pull Request
-
-## Issue Reporting
-
-- Please submit issues in GitHub Issues if you encounter problems
-- Please describe the issue phenomenon, reproduction steps, and system environment in detail
-- Attach relevant screenshots or log files
+- Regular config files are stored in the `configs` directory by default
+- Custom rules, sort order, and global settings are saved automatically
+- The rule store supports downloading and importing remote rule packs
+- Common config files include:
+  - `configs\\cdisk_cleaner_config.json`
+  - `configs\\cdisk_cleaner_custom_rules.json`
+  - `configs\\cdisk_cleaner_global_settings.json`
+- Custom rule format: <https://docs.cus.cc.cd/guide/config.html>
 
 ## Disclaimer
 
-This tool is for learning and personal use only. Cleanup operations carry certain risks:
-
-- It is recommended to **create a system restore point** before cleaning
-- Do not delete unclear large files arbitrarily
-- Please **backup the registry** before registry cleanup
-- The author is not responsible for any data loss
-- By using this tool, you agree to assume all risks at your own discretion
+- Cleanup and uninstall operations carry risk
+- Create a restore point or back up important data before high-risk actions
+- Review selected rules carefully before deleting anything uncertain
