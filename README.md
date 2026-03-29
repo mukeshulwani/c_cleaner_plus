@@ -33,7 +33,7 @@
 面向 Windows 的全盘清理工具，覆盖常规清理、大文件扫描、更多清理、应用强力卸载、定时任务和规则商店等常见场景。  
 项目基于 **Python + PySide6 + Fluent Widgets** 开发，提供图形界面，支持管理员提权、深浅色主题、侧边栏样式切换，以及按需导入远程规则包。
 
-<img width="1682" height="969" alt="QQ_1772472271177" src="https://picui.ogmua.cn/s1/2026/03/14/69b5379caafa3.webp" />
+<img width="1800" height="1050" alt="QQ_1774760187796" src="https://github.com/user-attachments/assets/9719cbee-6162-450e-91b7-2508b4add313" />
 
 ## 功能概览
 
