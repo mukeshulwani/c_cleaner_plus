@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-C盘强力清理工具 v0.4.9
+C盘强力清理工具 v0.5.0
 PySide6 + PySide6-Fluent-Widgets (Fluent2 UI)
 包含：常规清理(支持拖拽排序与自定义规则)、大文件扫描、重复文件、空文件夹、无效快捷方式等
 """
@@ -37,7 +37,7 @@ from qfluentwidgets.common.router import qrouter
 # ══════════════════════════════════════════════════════════
 #  版本与更新配置
 # ══════════════════════════════════════════════════════════
-CURRENT_VERSION = "0.4.9"
+CURRENT_VERSION = "0.5.0"
 UPDATE_JSON_URL = "https://gitee.com/kio0/c_cleaner_plus/raw/master/update.json"
 APP_SCHEDULED_TASK_PREFIX = "C盘强力清理工具 - "
 APP_AUTOSTART_TASK_NAME = "C盘强力清理工具 开机自启"
@@ -1074,13 +1074,13 @@ def force_delete_registry(full_path, log_fn):
         path_text = str(full_path or "").strip()
         if not path_text or not _VALID_REGISTRY_PATH_RE.match(path_text):
             log_fn(f"[强删注册表] 路径格式非法，已拒绝: {full_path}")
-            return False
+            return "failed"
         cmd = ['reg', 'delete', path_text, '/f']
         # creationflags=subprocess.CREATE_NO_WINDOW 防止弹黑框
         r = subprocess.run(cmd, capture_output=True, text=True, creationflags=subprocess.CREATE_NO_WINDOW)
         if r.returncode == 0:
             log_fn(f"[强删注册表] 成功: {path_text}")
-            return True
+            return "deleted"
         else:
             err_msg = r.stderr.strip().replace('\n', ' ')
             err_lower = err_msg.lower()
@@ -1088,17 +1088,19 @@ def force_delete_registry(full_path, log_fn):
                 "unable to find the specified registry key or value" in err_lower or
                 "找不到指定的注册表项" in err_msg):
                 log_fn(f"[强删注册表] 已不存在: {path_text}")
+                return "missing"
             elif ("拒绝访问" in err_msg or
                   "access is denied" in err_lower or
                   "denied" in err_lower or
                   "权限" in err_msg):
                 log_fn(f"[强删注册表] 权限不足(可能受系统保护): {path_text} -> {err_msg}")
+                return "denied"
             else:
                 log_fn(f"[强删注册表] 删除失败: {path_text} -> {err_msg}")
-            return False
+                return "failed"
     except Exception as e:
         log_fn(f"[强删注册表] 异常: {e}")
-        return False
+        return "failed"
 
 def _set_registry_value(root, subkey, name, value, value_type=winreg.REG_SZ):
     with winreg.CreateKey(root, subkey) as key:
@@ -1112,23 +1114,6 @@ def _notify_shell_assoc_changed(log_fn):
         log_fn("[恢复关联] 已广播资源管理器关联刷新通知")
     except Exception as e:
         log_fn(f"[恢复关联] 广播关联刷新失败: {e}")
-
-def _restart_explorer_process(log_fn):
-    try:
-        log_fn("[恢复关联] 正在重启 explorer.exe ...")
-        subprocess.run(
-            ["taskkill", "/f", "/im", "explorer.exe"],
-            capture_output=True,
-            text=True,
-            creationflags=subprocess.CREATE_NO_WINDOW,
-        )
-        time.sleep(1.0)
-        subprocess.Popen(["explorer.exe"])
-        log_fn("[恢复关联] explorer.exe 已重新启动")
-        return True
-    except Exception as e:
-        log_fn(f"[恢复关联] 重启 explorer.exe 失败: {e}")
-        return False
 
 def restore_default_explorer_associations(log_fn):
     """恢复常见的资源管理器打开动作和可执行文件关联。"""
@@ -1180,14 +1165,8 @@ def restore_default_explorer_associations(log_fn):
             force_delete_registry(path, log_fn)
 
         _notify_shell_assoc_changed(log_fn)
-        restarted = _restart_explorer_process(log_fn)
-
-        if restarted:
-            log_fn("[恢复关联] 默认资源管理器关联已恢复，并已刷新关联与重启资源管理器")
-            return True, "默认资源管理器关联已恢复，资源管理器已重启"
-
-        log_fn("[恢复关联] 默认资源管理器关联已恢复，但资源管理器未能自动重启")
-        return True, "默认资源管理器关联已恢复，请手动重启资源管理器或重新登录系统"
+        log_fn("[恢复关联] 默认资源管理器关联已恢复，并已广播刷新通知")
+        return True, "默认资源管理器关联已恢复；如资源管理器仍异常，请手动重启 explorer.exe 或重新登录系统"
     except Exception as e:
         log_fn(f"[恢复关联] 失败: {e}")
         return False, f"恢复默认资源管理器关联失败: {e}"
@@ -1555,7 +1534,8 @@ def delete_service_entry(service_name, reg_path, log_fn):
         ok = False
         log_fn(f"[删除服务] 异常: {service_name} -> {e}")
 
-    reg_ok = force_delete_registry(reg_path, log_fn) if reg_path else True
+    reg_state = force_delete_registry(reg_path, log_fn) if reg_path else "deleted"
+    reg_ok = reg_state in {"deleted", "missing"}
     return ok and reg_ok
 
 def delete_scheduled_task(full_name, log_fn):
@@ -1879,6 +1859,7 @@ UNINSTALL_TABLE_MAX_ROWS = 800
 MORE_TABLE_MAX_ROWS = 1500
 UI_BATCH_INTERVAL_MS = 30
 UI_BATCH_CHUNK = 120
+LEFTOVER_PROMPT_TIMEOUT_SEC = 600
 
 def should_exclude(p, prefixes):
     n = os.path.normcase(os.path.abspath(p))
@@ -2484,9 +2465,14 @@ class DeferredPageMixin:
             QTimer.singleShot(delay, lambda: self._ensure_stage(stage_name, immediate=True, delay=delay, on_ready=on_ready))
             return False
         setattr(self, pending_attr, False)
+        try:
+            if callable(on_ready):
+                on_ready()
+        except Exception:
+            setattr(self, initialized_attr, False)
+            setattr(self, pending_attr, False)
+            raise
         setattr(self, initialized_attr, True)
-        if callable(on_ready):
-            on_ready()
         return True
 
 
@@ -3390,7 +3376,7 @@ def _run_scheduled_registry_cleanup(log):
     log(f"[卸载注册表清理] 发现 {len(invalid_paths)} 个无效卸载注册表项，开始清理")
     ok = fl = 0
     for reg_path in invalid_paths:
-        if force_delete_registry(reg_path, log):
+        if force_delete_registry(reg_path, log) in {"deleted", "missing"}:
             ok += 1
         else:
             fl += 1
@@ -6669,8 +6655,15 @@ class UninstallPage(DeferredPageMixin, ScrollArea):
                 self._current_uninstalling = (r, nm, pub, loc, reg)
                 self._leftover_prompt_done = threading.Event()
                 self._leftover_prompt_done.clear()
-                QMetaObject.invokeMethod(self, "prompt_leftover_scan", Qt.ConnectionType.QueuedConnection)
-                self._leftover_prompt_done.wait()
+                invoked = QMetaObject.invokeMethod(self, "prompt_leftover_scan", Qt.ConnectionType.QueuedConnection)
+                if not invoked:
+                    self.sig.uninst_log.emit(f"[标准卸载] 无法调起残留扫描确认，已跳过: {nm}")
+                    self._current_uninstalling = None
+                    self._leftover_prompt_done.set()
+                elif not self._leftover_prompt_done.wait(timeout=LEFTOVER_PROMPT_TIMEOUT_SEC):
+                    self.sig.uninst_log.emit(f"[标准卸载] 等待残留扫描确认超时，已跳过: {nm}")
+                    self._current_uninstalling = None
+                    self._leftover_prompt_done.set()
             except Exception as e:
                 fl += 1
                 self.sig.uninst_log.emit(f"[标准卸载] 启动失败: {nm} -> {e}")
@@ -6837,7 +6830,7 @@ class UninstallPage(DeferredPageMixin, ScrollArea):
         for reg_path in regs:
             if _check_stop():
                 return
-            if force_delete_registry(reg_path, lf):
+            if force_delete_registry(reg_path, lf) in {"deleted", "missing"}:
                 stats["regs"]["ok"] += 1
             else:
                 stats["regs"]["fail"] += 1
@@ -7934,7 +7927,7 @@ class MoreCleanPage(DeferredPageMixin, ScrollArea):
                 return
             
             # 使用新的强制删除函数
-            if force_delete_registry(p, self.sig.more_log.emit):
+            if force_delete_registry(p, self.sig.more_log.emit) in {"deleted", "missing"}:
                 ok += 1
             else:
                 fl += 1
