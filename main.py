@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-C盘强力清理工具 v0.6.1
+C盘强力清理工具 v0.6.2
 PySide6 + PySide6-Fluent-Widgets (Fluent2 UI)
 包含：常规清理(支持拖拽排序与自定义规则)、大文件扫描、重复文件、空文件夹、无效快捷方式等
 """
@@ -11,7 +11,7 @@ import webbrowser
 from collections import defaultdict
 from dataclasses import dataclass
 
-from PySide6.QtCore import Qt, Signal, QObject, QPoint, QMetaObject, Slot, QFileInfo, QSize, QTimer, QAbstractTableModel, QModelIndex, QEvent, QMimeData
+from PySide6.QtCore import Qt, Signal, QObject, QPoint, QMetaObject, Slot, QFileInfo, QSize, QTimer, QAbstractTableModel, QModelIndex, QEvent, QMimeData, QLocale
 from PySide6.QtGui import QFont, QIcon, QColor, QPainter, QDrag, QPixmap, QRegion, QTextCursor, QAction
 from qfluentwidgets import isDarkTheme, themeColor, qconfig
 from PySide6.QtWidgets import (
@@ -34,10 +34,99 @@ from qfluentwidgets import (
 )
 from qfluentwidgets.common.router import qrouter
 
+_FluentMessageBox = MessageBox
+_FluentInfoBar = InfoBar
+
+def _runtime_i18n_host(parent):
+    if parent is None:
+        return None
+    if hasattr(parent, "tr_text") and hasattr(parent, "language_pack"):
+        return parent
+    try:
+        win = parent.window()
+        if hasattr(win, "tr_text") and hasattr(win, "language_pack"):
+            return win
+    except Exception:
+        pass
+    return None
+
+def _runtime_tr(parent, text):
+    if text is None:
+        return text
+    raw = str(text)
+    host = _runtime_i18n_host(parent)
+    pack = getattr(host, "language_pack", None)
+    if not pack:
+        return raw
+    exact = pack.get(raw)
+    if exact is not None:
+        return exact
+    if not re.search(r"[\u4e00-\u9fff]", raw):
+        return raw
+    if re.search(r"[A-Za-z]:\\|\\\\|/", raw):
+        return raw
+    translated = raw
+    keys = getattr(host, "_runtime_i18n_keys", None)
+    if keys is None:
+        keys = sorted(
+            (key for key in pack if isinstance(key, str) and re.search(r"[\u4e00-\u9fff]", key)),
+            key=len,
+            reverse=True,
+        )
+        try:
+            host._runtime_i18n_keys = keys
+        except Exception:
+            pass
+    for key in keys:
+        if len(key) >= 3 and key in translated:
+            translated = translated.replace(key, str(pack.get(key, key)))
+    return translated
+
+def MessageBox(title, content, parent=None, *args, **kwargs):
+    return _FluentMessageBox(
+        _runtime_tr(parent, title),
+        _runtime_tr(parent, content),
+        parent,
+        *args,
+        **kwargs,
+    )
+
+class _RuntimeInfoBar:
+    def __init__(self, wrapped):
+        self._wrapped = wrapped
+
+    def __getattr__(self, name):
+        return getattr(self._wrapped, name)
+
+    def _call(self, name, *args, **kwargs):
+        parent = kwargs.get("parent")
+        if parent is None and len(args) >= 3 and isinstance(args[2], QWidget):
+            parent = args[2]
+        items = list(args)
+        if len(items) >= 1:
+            items[0] = _runtime_tr(parent, items[0])
+        if len(items) >= 2:
+            items[1] = _runtime_tr(parent, items[1])
+        return getattr(self._wrapped, name)(*items, **kwargs)
+
+    def success(self, *args, **kwargs):
+        return self._call("success", *args, **kwargs)
+
+    def warning(self, *args, **kwargs):
+        return self._call("warning", *args, **kwargs)
+
+    def error(self, *args, **kwargs):
+        return self._call("error", *args, **kwargs)
+
+    def info(self, *args, **kwargs):
+        return self._call("info", *args, **kwargs)
+
+InfoBar = _RuntimeInfoBar(_FluentInfoBar)
+
 # ══════════════════════════════════════════════════════════
 #  版本与更新配置
 # ══════════════════════════════════════════════════════════
-CURRENT_VERSION = "0.6.1"
+CURRENT_VERSION = "0.6.2"
 UPDATE_JSON_URL = "https://gitee.com/kio0/c_cleaner_plus/raw/master/update.json"
 APP_SCHEDULED_TASK_PREFIX = "C盘强力清理工具 - "
 APP_AUTOSTART_TASK_NAME = "C盘强力清理工具 开机自启"
@@ -50,6 +139,13 @@ THEME_MODE_LABELS = {
     "light": "浅色",
     "dark": "深色"
 }
+LANGUAGE_MODE_LABELS = {
+    "auto": "跟随系统",
+    "zh_cn": "简体中文",
+    "en_us": "English"
+}
+LANGUAGE_MANIFEST_URL = "https://raw.githubusercontent.com/Kiowx/c_cleaner_plus/refs/heads/main/i18n/manifest.json"
+LANGUAGE_PACK_URLS = {}
 
 from qfluentwidgets.components.widgets.table_view import TableItemDelegate
 
@@ -3108,10 +3204,20 @@ class CleanRulesTableModel(QAbstractTableModel):
             return 0
         return 5
 
-    @staticmethod
-    def _display_name(row):
+    def _tr(self, text):
+        try:
+            parent = self.parent()
+            win = parent.window() if parent is not None and hasattr(parent, "window") else None
+            if win is not None and hasattr(win, "tr_text"):
+                return win.tr_text(text)
+        except Exception:
+            pass
+        return text
+
+    def _display_name(self, row):
         name = str(row.name or "")
-        return f"{name} (自定义)" if row.is_custom else name
+        text = self._tr(name)
+        return f"{text} ({self._tr('自定义')})" if row.is_custom else text
 
     @staticmethod
     def _display_path(row):
@@ -3141,7 +3247,7 @@ class CleanRulesTableModel(QAbstractTableModel):
             if col == 2:
                 return self._display_path(row)
             if col == 3:
-                return row.note
+                return self._tr(row.note)
             if col == 4:
                 return self._size_text(row)
             return ""
@@ -3153,7 +3259,7 @@ class CleanRulesTableModel(QAbstractTableModel):
             if col == 2:
                 return self._display_path(row)
             if col == 3:
-                return row.note
+                return self._tr(row.note)
             if col == 1:
                 return self._display_name(row)
 
@@ -3193,7 +3299,7 @@ class CleanRulesTableModel(QAbstractTableModel):
 
     def headerData(self, section, orientation, role=Qt.ItemDataRole.DisplayRole):
         if orientation == Qt.Orientation.Horizontal and role == Qt.ItemDataRole.DisplayRole:
-            return self.headers[section]
+            return self._tr(self.headers[section])
         return super().headerData(section, orientation, role)
 
     def clear(self):
@@ -3452,6 +3558,16 @@ class BigFileTableModel(QAbstractTableModel):
             return 0
         return 4
 
+    def _tr(self, text):
+        try:
+            parent = self.parent()
+            win = parent.window() if parent is not None and hasattr(parent, "window") else None
+            if win is not None and hasattr(win, "tr_text"):
+                return win.tr_text(text)
+        except Exception:
+            pass
+        return text
+
     def data(self, index, role=Qt.ItemDataRole.DisplayRole):
         if not index.isValid():
             return None
@@ -3511,7 +3627,7 @@ class BigFileTableModel(QAbstractTableModel):
 
     def headerData(self, section, orientation, role=Qt.ItemDataRole.DisplayRole):
         if orientation == Qt.Orientation.Horizontal and role == Qt.ItemDataRole.DisplayRole:
-            return self.headers[section]
+            return self._tr(self.headers[section])
         return super().headerData(section, orientation, role)
 
     def clear(self):
@@ -3584,6 +3700,16 @@ class MoreCleanTableModel(QAbstractTableModel):
             return 0
         return 5
 
+    def _tr(self, text):
+        try:
+            parent = self.parent()
+            win = parent.window() if parent is not None and hasattr(parent, "window") else None
+            if win is not None and hasattr(win, "tr_text"):
+                return win.tr_text(text)
+        except Exception:
+            pass
+        return text
+
     def data(self, index, role=Qt.ItemDataRole.DisplayRole):
         if not index.isValid():
             return None
@@ -3595,7 +3721,7 @@ class MoreCleanTableModel(QAbstractTableModel):
 
         if role in (Qt.ItemDataRole.DisplayRole, Qt.ItemDataRole.EditRole):
             if col == 1:
-                return row["type"]
+                return self._tr(row["type"])
             if col == 2:
                 return row["name"]
             if col == 3:
@@ -3652,7 +3778,7 @@ class MoreCleanTableModel(QAbstractTableModel):
 
     def headerData(self, section, orientation, role=Qt.ItemDataRole.DisplayRole):
         if orientation == Qt.Orientation.Horizontal and role == Qt.ItemDataRole.DisplayRole:
-            return self.headers[section]
+            return self._tr(self.headers[section])
         return super().headerData(section, orientation, role)
 
     def clear(self):
@@ -3730,6 +3856,16 @@ class UninstallTableModel(QAbstractTableModel):
             return 0
         return 7
 
+    def _tr(self, text):
+        try:
+            parent = self.parent()
+            win = parent.window() if parent is not None and hasattr(parent, "window") else None
+            if win is not None and hasattr(win, "tr_text"):
+                return win.tr_text(text)
+        except Exception:
+            pass
+        return text
+
     def data(self, index, role=Qt.ItemDataRole.DisplayRole):
         if not index.isValid():
             return None
@@ -3741,7 +3877,7 @@ class UninstallTableModel(QAbstractTableModel):
 
         if role in (Qt.ItemDataRole.DisplayRole, Qt.ItemDataRole.EditRole):
             if col == 1:
-                return row["category"]
+                return self._tr(row["category"])
             if col == 2:
                 return row["name"]
             if col == 3:
@@ -3769,7 +3905,7 @@ class UninstallTableModel(QAbstractTableModel):
 
         if role == Qt.ItemDataRole.ToolTipRole and col in (1, 2, 5):
             if col in (1, 2):
-                return build_uninstall_risk_tip(row.get("category", "用户"), row.get("is_risky", False), row.get("risk_reason", ""))
+                return self._tr(build_uninstall_risk_tip(row.get("category", "用户"), row.get("is_risky", False), row.get("risk_reason", "")))
             return row.get("location", "")
 
         if role == Qt.ItemDataRole.UserRole:
@@ -3804,7 +3940,7 @@ class UninstallTableModel(QAbstractTableModel):
 
     def headerData(self, section, orientation, role=Qt.ItemDataRole.DisplayRole):
         if orientation == Qt.Orientation.Horizontal and role == Qt.ItemDataRole.DisplayRole:
-            return self.headers[section]
+            return self._tr(self.headers[section])
         return super().headerData(section, orientation, role)
 
     def clear(self):
@@ -4118,6 +4254,167 @@ def resolve_theme_enum(theme_mode):
         "dark": Theme.DARK
     }.get(mode, Theme.AUTO)
 
+def normalize_language_mode(language_mode):
+    mode = str(language_mode or "").strip().lower().replace("-", "_")
+    return mode if mode in LANGUAGE_MODE_LABELS else "auto"
+
+def detect_system_language():
+    try:
+        name = QLocale.system().name().lower().replace("-", "_")
+    except Exception:
+        name = ""
+    return "en_us" if name.startswith("en") else "zh_cn"
+
+def resolve_language_mode(language_mode):
+    mode = normalize_language_mode(language_mode)
+    return detect_system_language() if mode == "auto" else mode
+
+def language_cache_path(lang, config_dir=None):
+    cfg = os.path.abspath(os.path.expandvars(config_dir or get_runtime_config_dir()))
+    return os.path.join(cfg, "i18n", f"{lang}.json")
+
+def language_manifest_cache_path(config_dir=None):
+    cfg = os.path.abspath(os.path.expandvars(config_dir or get_runtime_config_dir()))
+    return os.path.join(cfg, "i18n", "manifest.json")
+
+def bundled_language_file(name):
+    return resource_path(os.path.join("i18n", name))
+
+def _normalize_language_manifest(payload):
+    if not isinstance(payload, dict):
+        return {}
+    raw_items = payload.get("languages", payload.get("packs", payload))
+    if isinstance(raw_items, dict):
+        iterator = raw_items.items()
+    elif isinstance(raw_items, list):
+        iterator = []
+        pairs = []
+        for item in raw_items:
+            if isinstance(item, dict):
+                code = item.get("code") or item.get("lang") or item.get("id")
+                pairs.append((code, item))
+        iterator = pairs
+    else:
+        iterator = []
+
+    manifest = {}
+    for code, item in iterator:
+        lang = normalize_language_mode(code)
+        if lang in ("auto", "zh_cn"):
+            continue
+        if isinstance(item, str):
+            url = item
+            label = LANGUAGE_MODE_LABELS.get(lang, lang)
+        elif isinstance(item, dict):
+            url = item.get("url") or item.get("download_url") or item.get("href") or ""
+            label = item.get("label") or item.get("name") or LANGUAGE_MODE_LABELS.get(lang, lang)
+        else:
+            continue
+        url = str(url or "").strip()
+        if url:
+            manifest[lang] = {"url": url, "label": str(label or lang)}
+    return manifest
+
+def load_language_manifest(config_dir=None, prefer_cloud=True, timeout=6):
+    cache_path = language_manifest_cache_path(config_dir)
+    if prefer_cloud:
+        try:
+            with urllib.request.urlopen(LANGUAGE_MANIFEST_URL, timeout=timeout) as resp:
+                raw = resp.read().decode("utf-8")
+            payload = json.loads(raw)
+            manifest = _normalize_language_manifest(payload)
+            if manifest:
+                os.makedirs(os.path.dirname(cache_path), exist_ok=True)
+                write_text_file_atomic(cache_path, json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+                append_session_log_line("[语言] 已下载语言包列表")
+                return manifest
+        except Exception as e:
+            log_sampled_background_error("下载语言包列表失败", e, limit=2)
+
+    try:
+        bundled_path = bundled_language_file("manifest.json")
+        if os.path.exists(bundled_path):
+            with open(bundled_path, "r", encoding="utf-8") as f:
+                manifest = _normalize_language_manifest(json.load(f))
+            if manifest:
+                append_session_log_line("[语言] 已加载内置语言包列表")
+                return manifest
+    except Exception as e:
+        log_sampled_background_error("读取内置语言包列表失败", e, limit=2)
+
+    try:
+        if os.path.exists(cache_path):
+            with open(cache_path, "r", encoding="utf-8") as f:
+                manifest = _normalize_language_manifest(json.load(f))
+            if manifest:
+                append_session_log_line("[语言] 已加载缓存语言包列表")
+                return manifest
+    except Exception as e:
+        log_sampled_background_error("读取语言包列表缓存失败", e, limit=2)
+    return {}
+
+def _normalize_language_pack(payload):
+    if not isinstance(payload, dict):
+        return {}
+    data = payload.get("translations", payload)
+    if not isinstance(data, dict):
+        return {}
+    return {
+        str(k): str(v)
+        for k, v in data.items()
+        if str(k).strip() and str(v).strip()
+    }
+
+def load_language_pack(lang, config_dir=None, prefer_cloud=True, timeout=6, manifest=None):
+    lang = normalize_language_mode(lang)
+    if lang in ("auto", "zh_cn"):
+        return {}
+    cache_path = language_cache_path(lang, config_dir)
+    manifest = manifest or {}
+    url = ""
+    if isinstance(manifest.get(lang), dict):
+        url = manifest.get(lang, {}).get("url", "")
+    elif isinstance(manifest.get(lang), str):
+        url = manifest.get(lang, "")
+    if not url:
+        url = LANGUAGE_PACK_URLS.get(lang, "")
+
+    if prefer_cloud and url:
+        try:
+            with urllib.request.urlopen(url, timeout=timeout) as resp:
+                raw = resp.read().decode("utf-8")
+            payload = json.loads(raw)
+            pack = _normalize_language_pack(payload)
+            if pack:
+                os.makedirs(os.path.dirname(cache_path), exist_ok=True)
+                write_text_file_atomic(cache_path, json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+                append_session_log_line(f"[语言] 已下载语言包: {lang}")
+                return pack
+        except Exception as e:
+            log_sampled_background_error(f"下载语言包失败:{lang}", e, limit=2)
+
+    try:
+        bundled_path = bundled_language_file(f"{lang}.json")
+        if os.path.exists(bundled_path):
+            with open(bundled_path, "r", encoding="utf-8") as f:
+                pack = _normalize_language_pack(json.load(f))
+            if pack:
+                append_session_log_line(f"[语言] 已加载内置语言包: {lang}")
+                return pack
+    except Exception as e:
+        log_sampled_background_error(f"读取内置语言包失败:{lang}", e, limit=2)
+
+    try:
+        if os.path.exists(cache_path):
+            with open(cache_path, "r", encoding="utf-8") as f:
+                pack = _normalize_language_pack(json.load(f))
+            if pack:
+                append_session_log_line(f"[语言] 已加载缓存语言包: {lang}")
+                return pack
+    except Exception as e:
+        log_sampled_background_error(f"读取语言包缓存失败:{lang}", e, limit=2)
+    return {}
+
 def load_runtime_global_settings(config_dir=None):
     paths = get_runtime_config_paths(config_dir)
     path = paths["global"]
@@ -4135,6 +4432,7 @@ def load_runtime_targets_and_settings():
     paths = get_runtime_config_paths()
     global_settings = {
         "auto_save": True,
+        "language_mode": "auto",
         "update_channel": "stable",
         "protect_builtin_rules": True,
         "deleted_builtin_rules": []
@@ -7270,6 +7568,17 @@ class SettingPage(ScrollArea):
         self.cb_theme_mode.currentIndexChanged.connect(self._on_theme_mode_changed)
         self.cb_theme_mode.setFixedWidth(116)
 
+        self.cb_language_mode = ComboBox()
+        self.cb_language_mode.addItems([
+            LANGUAGE_MODE_LABELS["auto"],
+            LANGUAGE_MODE_LABELS["zh_cn"],
+            LANGUAGE_MODE_LABELS["en_us"]
+        ])
+        saved_language_mode = normalize_language_mode(self.main_win.global_settings.get("language_mode", "auto"))
+        self.cb_language_mode.setCurrentIndex({"auto": 0, "zh_cn": 1, "en_us": 2}.get(saved_language_mode, 0))
+        self.cb_language_mode.currentIndexChanged.connect(self._on_language_mode_changed)
+        self.cb_language_mode.setFixedWidth(130)
+
         self.cb_sidebar_style = ComboBox()
         self.cb_sidebar_style.addItems([SIDEBAR_STYLE_LABELS["horizontal"], SIDEBAR_STYLE_LABELS["vertical"]])
         saved_sidebar_style = self.main_win.global_settings.get("sidebar_style", "vertical")
@@ -7357,6 +7666,12 @@ class SettingPage(ScrollArea):
                 "主题样式",
                 "可切换为跟随系统、浅色或深色，修改后立即生效",
                 self.cb_theme_mode
+            ),
+            self._make_setting_row(
+                FIF.DOCUMENT,
+                "语言",
+                "跟随系统时会检测英文环境，并自动从云端获取语言包",
+                self.cb_language_mode
             ),
             self._make_setting_row(
                 FIF.ALIGNMENT,
@@ -7452,7 +7767,23 @@ class SettingPage(ScrollArea):
     def _style_action_control(self, widget, width=None):
         widget.setFixedHeight(32)
         if width is not None:
-            widget.setFixedWidth(width)
+            widget.setMinimumWidth(width)
+
+    def _tr(self, text):
+        return self.main_win.tr_text(text) if hasattr(self.main_win, "tr_text") else str(text or "")
+
+    def _fit_action_controls(self):
+        for button in self.view.findChildren(PushButton):
+            try:
+                text_width = button.fontMetrics().horizontalAdvance(button.text())
+                button.setMinimumWidth(max(button.minimumWidth(), text_width + 58))
+            except Exception:
+                pass
+
+    def apply_language_layout(self):
+        self._refresh_config_dir_text()
+        self.set_latest_version_text(self.lbl_latest_version.text())
+        self._fit_action_controls()
 
     def _smooth_title_font(self, label):
         setFont(label, 13, QFont.Weight.Medium)
@@ -7595,12 +7926,17 @@ class SettingPage(ScrollArea):
         self.main_win.apply_theme_mode()
         InfoBar.success("已更新", f"主题已切换为{THEME_MODE_LABELS.get(mode, '当前')}模式", parent=self.main_win)
 
+    def _on_language_mode_changed(self, _):
+        mode = {0: "auto", 1: "zh_cn", 2: "en_us"}.get(self.cb_language_mode.currentIndex(), "auto")
+        self.main_win.set_language_mode(mode)
+        InfoBar.success("已更新", f"语言已切换为{LANGUAGE_MODE_LABELS.get(mode, '当前')}", parent=self.main_win)
+
     def _refresh_config_dir_text(self):
         cur_dir = self.main_win.config_dir
         default_dir = self.main_win.default_config_dir
-        text = f"当前: {display_path(cur_dir)}"
+        text = f"{self._tr('当前:')} {display_path(cur_dir)}"
         if os.path.normcase(os.path.abspath(cur_dir)) != os.path.normcase(os.path.abspath(default_dir)):
-            text += f"\n默认: {display_path(default_dir)}"
+            text += f"\n{self._tr('默认:')} {display_path(default_dir)}"
         self.lbl_config_dir.setText(text)
         self.lbl_config_dir.setToolTip(display_path(cur_dir))
 
@@ -7638,9 +7974,10 @@ class SettingPage(ScrollArea):
         self.main_win.check_updates(manual=True)
 
     def set_latest_version_text(self, text):
-        self.lbl_latest_version.setText(text)
+        display = _runtime_tr(self.main_win, text)
+        self.lbl_latest_version.setText(display)
         if hasattr(self, "lbl_latest_chip"):
-            self.lbl_latest_chip.setText(text.replace("：", " ", 1))
+            self.lbl_latest_chip.setText(display.replace("：", " ", 1).replace(":", " ", 1))
 
     def _refresh_cache(self):
         try:
@@ -7705,8 +8042,9 @@ class CleanPage(ScrollArea):
         self.view=QWidget(); self.setWidget(self.view); self.setWidgetResizable(True); self.setObjectName("cleanPage"); self.enableTransparentBackground()
         v=QVBoxLayout(self.view); v.setContentsMargins(28,12,28,20); v.setSpacing(8)
         title_row = make_title_row(FIF.BROOM, "常规清理")
+        tr = parent.tr_text if parent is not None and hasattr(parent, "tr_text") else (lambda text: text)
         badge = "管理员" if is_admin() else "非管理员"
-        lbl_perm = CaptionLabel(f"当前权限：{badge}  |  长按或框选项目可拖动排序")
+        lbl_perm = CaptionLabel(f"{tr('当前权限：')}{tr(badge)}  |  {tr('长按或框选项目可拖动排序')}")
         setFont(lbl_perm, 11, QFont.Weight.Normal)
         lbl_perm.setTextColor(QColor(128, 128, 128))
         title_row.insertSpacing(2, 2) 
@@ -7722,7 +8060,7 @@ class CleanPage(ScrollArea):
         search_row.addSpacing(10)
         self.cb_sort = ComboBox()
         self.cb_sort.addItems(["默认顺序", "按名称", "按路径", "按大小"])
-        self.cb_sort.setFixedWidth(120)
+        self.cb_sort.setFixedWidth(180 if getattr(parent, "language_code", "zh_cn") == "en_us" else 120)
         self.cb_sort.currentIndexChanged.connect(self._on_sort_mode_changed)
         search_row.addWidget(self.cb_sort)
         search_row.addStretch()
@@ -7754,10 +8092,7 @@ class CleanPage(ScrollArea):
         self.tbl.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeMode.Fixed)
         self.tbl.horizontalHeader().setSectionResizeMode(3, QHeaderView.ResizeMode.Stretch)
         self.tbl.horizontalHeader().setSectionResizeMode(4, QHeaderView.ResizeMode.Fixed)
-        self.tbl.setColumnWidth(0, 44)
-        self.tbl.setColumnWidth(1, 150)
-        self.tbl.setColumnWidth(2, 380)
-        self.tbl.setColumnWidth(4, 95)
+        self.apply_language_layout()
         setFont(self.tbl, 12, QFont.Weight.Normal)
         setFont(self.tbl.horizontalHeader(), 12, QFont.Weight.DemiBold)
         self.tbl.verticalHeader().setDefaultSectionSize(30)
@@ -7784,6 +8119,15 @@ class CleanPage(ScrollArea):
     def sl(self): return self.footer.sl
     @property
     def log(self): return self.footer.log
+
+    def apply_language_layout(self):
+        if not hasattr(self, "tbl") or self.tbl is None:
+            return
+        is_english = getattr(self.window(), "language_code", "zh_cn") == "en_us"
+        self.tbl.setColumnWidth(0, 44)
+        self.tbl.setColumnWidth(1, 230 if is_english else 150)
+        self.tbl.setColumnWidth(2, 360 if is_english else 380)
+        self.tbl.setColumnWidth(4, 95)
 
     def _prune_estimated_sizes(self):
         with self._targets_lock:
@@ -10173,6 +10517,7 @@ class MoreCleanPage(DeferredPageMixin, ScrollArea):
 #  主窗口
 # ══════════════════════════════════════════════════════════
 class MainWindow(MSFluentWindow):
+    languagePackReady = Signal(object, str)
     PAGE_SWITCH_DURATION_MS = 180
     LAZY_PAGE_SWITCH_DURATION_MS = 130
 
@@ -10194,6 +10539,7 @@ class MainWindow(MSFluentWindow):
             "tray_enabled": False,
             "tray_start_hidden": False,
             "theme_mode": "auto",
+            "language_mode": "auto",
             "sidebar_style": "vertical",
             "update_channel": "stable",
             "protect_builtin_rules": True,
@@ -10210,6 +10556,10 @@ class MainWindow(MSFluentWindow):
         except Exception as e:
             log_background_error("读取开机自启状态失败", e)
         self.global_settings["theme_mode"] = normalize_theme_mode(self.global_settings.get("theme_mode", "auto"))
+        self.global_settings["language_mode"] = normalize_language_mode(self.global_settings.get("language_mode", "auto"))
+        self.language_code = resolve_language_mode(self.global_settings.get("language_mode", "auto"))
+        self.language_manifest = load_language_manifest(self.config_dir, prefer_cloud=False)
+        self.language_pack = load_language_pack(self.language_code, self.config_dir, prefer_cloud=False, manifest=self.language_manifest)
 
         self.targets = [parse_rule_entry(t) for t in default_clean_targets()]
         self.targets = [t for t in self.targets if t]
@@ -10281,6 +10631,7 @@ class MainWindow(MSFluentWindow):
         self._tray_exit_action = None
         self._tray_notice_shown = False
         self._tray_exit_requested = False
+        self.languagePackReady.connect(self._apply_downloaded_language_pack)
         self._pending_big_rows = []
         self._pending_uninstall_rows = []
         self._pending_more_rows = []
@@ -10296,11 +10647,14 @@ class MainWindow(MSFluentWindow):
         self.apply_theme_mode()
 
         self._init_nav(); self._init_win(); self._init_tray(); self._conn()
+        self.apply_language()
         self._request_disk_detect(force=False)
         QTimer.singleShot(2000, lambda: self.check_updates(manual=False))
         QTimer.singleShot(900, self._warmup_schedule_page)
         QTimer.singleShot(1500, self._schedule_lazy_prewarm)
         QTimer.singleShot(250, self._apply_initial_tray_state)
+        if self.language_code == "en_us":
+            QTimer.singleShot(600, self._download_language_pack_async)
         self._pending_legacy_migration = self._should_offer_legacy_migration()
         if self._pending_legacy_migration:
             QTimer.singleShot(800, self._prompt_legacy_config_migration)
@@ -10331,6 +10685,194 @@ class MainWindow(MSFluentWindow):
                 pass
         self.titleBar.raise_()
 
+    def tr_text(self, text):
+        raw = str(text or "")
+        return self.language_pack.get(raw, raw) if getattr(self, "language_pack", None) else raw
+
+    def _translate_widget_text(self, widget):
+        if widget is None or not getattr(self, "language_pack", None):
+            return
+        skip_value_classes = {"LineEdit", "SearchLineEdit", "TextEdit", "SpinBox"}
+        cls_name = widget.__class__.__name__
+        try:
+            if cls_name not in skip_value_classes and hasattr(widget, "text") and hasattr(widget, "setText"):
+                text = widget.text()
+                translated = self.tr_text(text)
+                if translated != text:
+                    widget.setText(translated)
+        except Exception:
+            pass
+        try:
+            if hasattr(widget, "placeholderText") and hasattr(widget, "setPlaceholderText"):
+                text = widget.placeholderText()
+                translated = self.tr_text(text)
+                if translated != text:
+                    widget.setPlaceholderText(translated)
+        except Exception:
+            pass
+        try:
+            tip = widget.toolTip()
+            translated = self.tr_text(tip)
+            if translated != tip:
+                widget.setToolTip(translated)
+        except Exception:
+            pass
+        try:
+            title = widget.windowTitle()
+            translated = self.tr_text(title)
+            if translated != title:
+                widget.setWindowTitle(translated)
+        except Exception:
+            pass
+        try:
+            if hasattr(widget, "count") and hasattr(widget, "itemText") and hasattr(widget, "setItemText"):
+                for i in range(widget.count()):
+                    text = widget.itemText(i)
+                    translated = self.tr_text(text)
+                    if translated != text:
+                        widget.setItemText(i, translated)
+        except Exception:
+            pass
+        try:
+            if hasattr(widget, "columnCount") and hasattr(widget, "horizontalHeaderItem"):
+                for col in range(widget.columnCount()):
+                    item = widget.horizontalHeaderItem(col)
+                    if item is None:
+                        continue
+                    text = item.text()
+                    translated = self.tr_text(text)
+                    if translated != text:
+                        item.setText(translated)
+        except Exception:
+            pass
+        try:
+            if hasattr(widget, "horizontalHeader") and hasattr(widget, "model"):
+                model = widget.model()
+                if model is not None and hasattr(model, "headerDataChanged"):
+                    cols = model.columnCount()
+                    if cols > 0:
+                        model.headerDataChanged.emit(Qt.Orientation.Horizontal, 0, cols - 1)
+        except Exception:
+            pass
+        try:
+            if hasattr(widget, "topLevelItemCount") and hasattr(widget, "headerItem"):
+                header = widget.headerItem()
+                if header is not None:
+                    for col in range(header.columnCount()):
+                        text = header.text(col)
+                        translated = self.tr_text(text)
+                        if translated != text:
+                            header.setText(col, translated)
+        except Exception:
+            pass
+        try:
+            if cls_name == "SwitchButton" and hasattr(widget, "setOnText") and hasattr(widget, "setOffText"):
+                if getattr(self, "language_code", "zh_cn") == "en_us":
+                    widget.setOnText("On")
+                    widget.setOffText("Off")
+                else:
+                    widget.setOnText("开启")
+                    widget.setOffText("关闭")
+        except Exception:
+            pass
+        try:
+            for action in widget.actions():
+                text = action.text()
+                translated = self.tr_text(text)
+                if translated != text:
+                    action.setText(translated)
+                tip = action.toolTip()
+                translated_tip = self.tr_text(tip)
+                if translated_tip != tip:
+                    action.setToolTip(translated_tip)
+        except Exception:
+            pass
+
+    def apply_language_to_widget(self, widget):
+        if widget is None or not getattr(self, "language_pack", None):
+            return
+        self._translate_widget_text(widget)
+        try:
+            for child in widget.findChildren(QWidget):
+                self._translate_widget_text(child)
+        except Exception as e:
+            log_sampled_background_error("应用语言包", e, limit=3)
+
+    def apply_language(self):
+        if not getattr(self, "language_pack", None):
+            return
+        self._sync_navigation_for_language()
+        self.setWindowTitle(f"{self.tr_text('C盘强力清理工具')} v{CURRENT_VERSION}")
+        for widget in (
+            self,
+            getattr(self, "pg_clean", None),
+            getattr(self, "pg_toolbox", None),
+            getattr(self, "pg_schedule", None),
+            getattr(self, "pg_setting", None),
+            getattr(self, "pg_rule_store", None),
+            getattr(self, "pg_big", None),
+            getattr(self, "pg_uninstall", None),
+            getattr(self, "pg_more", None),
+        ):
+            self.apply_language_to_widget(widget)
+            if widget is not None and hasattr(widget, "apply_language_layout"):
+                try:
+                    widget.apply_language_layout()
+                except Exception as e:
+                    log_sampled_background_error("应用语言布局", e, limit=3)
+        nav = getattr(self, "navigationInterface", None)
+        if isinstance(nav, NavigationBar):
+            nav.setFixedWidth(self._nav_bar_width())
+            self._polish_vertical_nav_items()
+
+    def _sync_navigation_for_language(self):
+        nav = getattr(self, "navigationInterface", None)
+        if nav is None:
+            return
+        saved_style = str(self.global_settings.get("sidebar_style", "vertical")).strip().lower()
+        effective_style = self._effective_sidebar_style(saved_style)
+        using_horizontal = isinstance(nav, NavigationInterface) and not isinstance(nav, NavigationBar)
+        needs_horizontal = effective_style == "horizontal"
+        if using_horizontal != needs_horizontal:
+            self.apply_sidebar_style()
+
+    def _download_language_pack_async(self):
+        lang = getattr(self, "language_code", "zh_cn")
+        if lang in ("auto", "zh_cn"):
+            return
+        config_dir = self.config_dir
+
+        def _worker():
+            manifest = load_language_manifest(config_dir, prefer_cloud=True)
+            pack = load_language_pack(lang, config_dir, prefer_cloud=True, manifest=manifest)
+            self.languagePackReady.emit(pack, lang)
+
+        threading.Thread(target=_worker, daemon=True).start()
+
+    def _apply_downloaded_language_pack(self, pack, lang):
+        if normalize_language_mode(lang) != getattr(self, "language_code", "zh_cn"):
+            return
+        if not isinstance(pack, dict) or not pack:
+            return
+        self.language_pack = pack
+        self.language_manifest = load_language_manifest(self.config_dir, prefer_cloud=False)
+        self.apply_language()
+
+    def set_language_mode(self, mode):
+        mode = normalize_language_mode(mode)
+        self.global_settings["language_mode"] = mode
+        self.save_global_settings()
+        self.language_code = resolve_language_mode(mode)
+        if self.language_code == "zh_cn":
+            self.language_pack = {}
+            self.apply_sidebar_style()
+            InfoBar.warning("提示", "切换回中文后，建议重启软件以恢复所有已翻译文本", parent=self)
+            return
+        self.language_manifest = load_language_manifest(self.config_dir, prefer_cloud=False)
+        self.language_pack = load_language_pack(self.language_code, self.config_dir, prefer_cloud=False, manifest=self.language_manifest)
+        self.apply_sidebar_style()
+        self._download_language_pack_async()
+
     def apply_sidebar_style(self, style=None):
         if style is not None:
             style = str(style).strip().lower()
@@ -10341,6 +10883,7 @@ class MainWindow(MSFluentWindow):
         current_route = current_page.objectName() if isinstance(current_page, QWidget) else ""
         self._setup_navigation_widget(force_rebuild=True)
         self._register_nav_items()
+        self.apply_language()
         if current_route:
             try:
                 self.navigationInterface.setCurrentItem(current_route)
@@ -10627,10 +11170,12 @@ class MainWindow(MSFluentWindow):
         super().closeEvent(event)
 
     def _setup_navigation_widget(self, force_rebuild=False):
-        style = str(self.global_settings.get("sidebar_style", "vertical")).strip().lower()
-        if style not in SIDEBAR_STYLE_LABELS:
-            style = "vertical"
-        self._sidebar_style = style
+        saved_style = str(self.global_settings.get("sidebar_style", "vertical")).strip().lower()
+        if saved_style not in SIDEBAR_STYLE_LABELS:
+            saved_style = "vertical"
+        style = self._effective_sidebar_style(saved_style)
+        self._sidebar_style = saved_style
+        self._effective_sidebar_style_value = style
 
         current_nav = getattr(self, "navigationInterface", None)
         need_horizontal = style == "horizontal"
@@ -10643,7 +11188,7 @@ class MainWindow(MSFluentWindow):
                 current_nav.setCollapsible(True)
                 return
             if not need_horizontal and is_vertical_nav:
-                current_nav.setFixedWidth(76)
+                current_nav.setFixedWidth(self._nav_bar_width())
                 return
 
         if current_nav is not None:
@@ -10661,10 +11206,59 @@ class MainWindow(MSFluentWindow):
             self.navigationInterface.displayModeChanged.connect(self.titleBar.raise_)
         else:
             self.navigationInterface = NavigationBar(self)
-            self.navigationInterface.setFixedWidth(76)
+            self.navigationInterface.setFixedWidth(self._nav_bar_width())
 
         self.hBoxLayout.insertWidget(0, self.navigationInterface)
         self.titleBar.raise_()
+
+    def _effective_sidebar_style(self, style=None):
+        raw_style = str(style or self.global_settings.get("sidebar_style", "vertical")).strip().lower()
+        if raw_style not in SIDEBAR_STYLE_LABELS:
+            raw_style = "vertical"
+        return raw_style
+
+    def _nav_bar_width(self):
+        return 76
+
+    def _nav_bar_item_width(self):
+        return max(64, self._nav_bar_width() - 12)
+
+    def _nav_bar_display_text(self, text):
+        if getattr(self, "language_code", "zh_cn") != "en_us":
+            return text
+        compact = {
+            "Standard Cleanup": "Clean",
+            "Rule Store": "Store",
+            "Scheduled Tasks": "Tasks",
+            "Toolbox": "Tools",
+            "Large File Scan": "Files",
+            "Force Uninstall": "Uninstall",
+            "More Cleanup": "More",
+            "Settings": "Settings",
+            "About": "About",
+        }
+        return compact.get(str(text or ""), text)
+
+    def _polish_vertical_nav_item(self, widget, text=""):
+        if not isinstance(getattr(self, "navigationInterface", None), NavigationBar) or widget is None:
+            return
+        try:
+            widget.setFixedSize(self._nav_bar_item_width(), 58)
+            if text and hasattr(widget, "setToolTip"):
+                widget.setToolTip(text)
+        except Exception:
+            pass
+
+    def _polish_vertical_nav_items(self):
+        nav = getattr(self, "navigationInterface", None)
+        if not isinstance(nav, NavigationBar):
+            return
+        try:
+            for widget in nav.items.values():
+                text = widget.text() if hasattr(widget, "text") else ""
+                self._polish_vertical_nav_item(widget, text)
+        except Exception:
+            pass
 
     def _get_lazy_placeholder(self, attr_name):
         placeholder = self._lazy_placeholders.get(attr_name)
@@ -10720,6 +11314,7 @@ class MainWindow(MSFluentWindow):
                 page._on_disk_ready(*self._detected_disk_info)
             except Exception:
                 pass
+        self.apply_language_to_widget(page)
         self._updateStackedBackground()
         return page
 
@@ -10764,27 +11359,30 @@ class MainWindow(MSFluentWindow):
             self.stackedWidget.addWidget(interface)
 
         route_key = interface.objectName()
+        nav_text = self.tr_text(text)
         def on_click(checked=False, page=interface):
             self._lazy_target_route = ""
             self._lazy_switch_token += 1
             self._switch_interface(page, self.PAGE_SWITCH_DURATION_MS)
 
         if isinstance(self.navigationInterface, NavigationBar):
-            self.navigationInterface.addItem(
+            display_text = self._nav_bar_display_text(nav_text)
+            item = self.navigationInterface.addItem(
                 routeKey=route_key,
                 icon=icon,
-                text=text,
+                text=display_text,
                 onClick=on_click,
                 position=position
             )
+            self._polish_vertical_nav_item(item, nav_text)
         else:
             self.navigationInterface.addItem(
                 routeKey=route_key,
                 icon=icon,
-                text=text,
+                text=nav_text,
                 onClick=on_click,
                 position=position,
-                tooltip=text
+                tooltip=nav_text
             )
 
         if not self._nav_connected:
@@ -10807,24 +11405,27 @@ class MainWindow(MSFluentWindow):
             self.stackedWidget.addWidget(interface)
 
         route_key = interface.objectName()
+        nav_text = self.tr_text(text)
         on_click = lambda checked=False, name=attr_name: self._switch_to_lazy_page(name)
 
         if isinstance(self.navigationInterface, NavigationBar):
-            self.navigationInterface.addItem(
+            display_text = self._nav_bar_display_text(nav_text)
+            item = self.navigationInterface.addItem(
                 routeKey=route_key,
                 icon=icon,
-                text=text,
+                text=display_text,
                 onClick=on_click,
                 position=position
             )
+            self._polish_vertical_nav_item(item, nav_text)
         else:
             self.navigationInterface.addItem(
                 routeKey=route_key,
                 icon=icon,
-                text=text,
+                text=nav_text,
                 onClick=on_click,
                 position=position,
-                tooltip=text
+                tooltip=nav_text
             )
 
         if not self._nav_connected:
@@ -10926,24 +11527,27 @@ class MainWindow(MSFluentWindow):
 
     def _add_nav_action(self, route_key, icon, text, on_click, position=NavigationItemPosition.BOTTOM):
         callback = (lambda checked=False: on_click())
+        nav_text = self.tr_text(text)
         if isinstance(self.navigationInterface, NavigationBar):
-            self.navigationInterface.addItem(
+            display_text = self._nav_bar_display_text(nav_text)
+            item = self.navigationInterface.addItem(
                 routeKey=route_key,
                 icon=icon,
-                text=text,
+                text=display_text,
                 onClick=callback,
                 selectable=False,
                 position=position
             )
+            self._polish_vertical_nav_item(item, nav_text)
         else:
             self.navigationInterface.addItem(
                 routeKey=route_key,
                 icon=icon,
-                text=text,
+                text=nav_text,
                 onClick=callback,
                 selectable=False,
                 position=position,
-                tooltip=text
+                tooltip=nav_text
             )
 
     def _init_nav(self):
@@ -10951,7 +11555,7 @@ class MainWindow(MSFluentWindow):
         self._register_nav_items()
 
     def _init_win(self):
-        self.resize(1200, 700); self.setMinimumSize(940, 560); self.setWindowTitle(f"C盘强力清理工具 v{CURRENT_VERSION}")
+        self.resize(1200, 700); self.setMinimumSize(940, 560); self.setWindowTitle(f"{self.tr_text('C盘强力清理工具')} v{CURRENT_VERSION}")
         icon_path = resource_path("icon.ico")
         if os.path.exists(icon_path): self.setWindowIcon(QIcon(icon_path))
         scr=QApplication.primaryScreen()
@@ -10975,12 +11579,12 @@ class MainWindow(MSFluentWindow):
             if os.path.exists(icon_path):
                 tray_icon = QIcon(icon_path)
         self._tray_icon.setIcon(tray_icon)
-        self._tray_icon.setToolTip(f"C盘强力清理工具 v{CURRENT_VERSION}")
+        self._tray_icon.setToolTip(f"{self.tr_text('C盘强力清理工具')} v{CURRENT_VERSION}")
 
         self._tray_menu = QMenu(self)
-        self._tray_restore_action = QAction("显示主窗口", self)
+        self._tray_restore_action = QAction(self.tr_text("显示主窗口"), self)
         self._tray_restore_action.triggered.connect(self._restore_from_tray)
-        self._tray_exit_action = QAction("退出", self)
+        self._tray_exit_action = QAction(self.tr_text("退出"), self)
         self._tray_exit_action.triggered.connect(self._exit_from_tray)
         self._tray_menu.addAction(self._tray_restore_action)
         self._tray_menu.addSeparator()
@@ -11025,8 +11629,8 @@ class MainWindow(MSFluentWindow):
         self._tray_notice_shown = True
         try:
             self._tray_icon.showMessage(
-                "C盘强力清理工具",
-                "软件已隐藏到系统托盘，可双击托盘图标恢复，或在托盘菜单中直接退出。",
+                self.tr_text("C盘强力清理工具"),
+                self.tr_text("软件已隐藏到系统托盘，可双击托盘图标恢复，或在托盘菜单中直接退出。"),
                 QSystemTrayIcon.MessageIcon.Information,
                 2500
             )
@@ -11388,7 +11992,7 @@ class MainWindow(MSFluentWindow):
             self._uninstall_flush_timer.start(0)
 
     def _about(self):
-        MessageBox("关于", f"C盘强力清理工具 v{CURRENT_VERSION}\nQQ交流群：670804369\nUI：Fluent Widgets\nby Kio",self).exec()
+        MessageBox(self.tr_text("关于"), f"{self.tr_text('C盘强力清理工具')} v{CURRENT_VERSION}\nQQ交流群：670804369\nUI：Fluent Widgets\nby Kio",self).exec()
 
 def relaunch_as_admin():
     def _show_relaunch_error(message):
