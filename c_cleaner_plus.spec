@@ -31,14 +31,19 @@ def add_binary_if_exists(path, dest="."):
 add_data_if_exists("app.ico", ".")
 add_data_if_exists("icon.ico", ".")
 add_data_if_exists("i18n", "i18n")
-add_data_if_exists("configs", "configs")
 add_data_if_exists("config", "config")
+add_data_if_exists("configs", "configs")
+add_data_if_exists("config_store.json", ".")
+add_data_if_exists("common_custom_rules.json", ".")
+add_data_if_exists("rules_cn_apps.json", ".")
+add_data_if_exists("rules_dev_tools.json", ".")
+add_data_if_exists("rules_game_platforms.json", ".")
 
 fast_mft_found = False
 for helper_path in (
-    "fast_large_files.exe",
     os.path.join("tools", "fast_large_files", "target", "release", "fast_large_files.exe"),
     os.path.join("tools", "fast_large_files", "target", "debug", "fast_large_files.exe"),
+    "fast_large_files.exe",
 ):
     if add_binary_if_exists(helper_path, "."):
         fast_mft_found = True
@@ -47,7 +52,7 @@ for helper_path in (
 if fast_mft_found:
     print("[MFT] fast_large_files.exe 已加入打包")
 else:
-    print("[MFT] 未找到 fast_large_files.exe，大文件扫描将使用普通回退路径")
+    print("[MFT] 未找到 fast_large_files.exe，将使用普通扫描回退路径")
 
 a = Analysis(
     ["main.py"],
