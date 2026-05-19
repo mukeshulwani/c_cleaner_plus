@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-C盘强力清理工具 v0.6.3
+C盘强力清理工具 v0.6.5
 PySide6 + PySide6-Fluent-Widgets (Fluent2 UI)
 包含：常规清理(支持拖拽排序与自定义规则)、大文件扫描、重复文件、空文件夹、无效快捷方式等
 """
@@ -126,7 +126,7 @@ InfoBar = _RuntimeInfoBar(_FluentInfoBar)
 # ══════════════════════════════════════════════════════════
 #  版本与更新配置
 # ══════════════════════════════════════════════════════════
-CURRENT_VERSION = "0.6.3"
+CURRENT_VERSION = "0.6.5"
 UPDATE_JSON_URL = "https://gitee.com/kio0/c_cleaner_plus/raw/master/update.json"
 APP_SCHEDULED_TASK_PREFIX = "C盘强力清理工具 - "
 APP_AUTOSTART_TASK_NAME = "C盘强力清理工具 开机自启"
@@ -255,21 +255,27 @@ def write_json_file_atomic(path, payload, ensure_ascii=False, indent=2):
     text = json.dumps(payload, ensure_ascii=ensure_ascii, indent=indent)
     write_text_file_atomic(path, text, encoding="utf-8")
 
+def read_json_file(path, default=None, expected_type=None, log_context="读取 JSON"):
+    fallback = default() if callable(default) else default
+    try:
+        if not path or not os.path.exists(path):
+            return fallback
+        with open(path, "r", encoding="utf-8") as f:
+            payload = json.load(f)
+        if expected_type is not None and not isinstance(payload, expected_type):
+            return fallback
+        return payload
+    except Exception as e:
+        log_background_error(log_context, e)
+        return fallback
+
 def scheduled_preset_path(config_dir=None):
     base_dir = os.path.abspath(os.path.expandvars(config_dir or get_runtime_config_dir()))
     return os.path.join(base_dir, "scheduled_task_presets.json")
 
 def load_scheduled_task_presets(config_dir=None):
     path = scheduled_preset_path(config_dir)
-    try:
-        if not os.path.exists(path):
-            return {}
-        with open(path, "r", encoding="utf-8") as f:
-            payload = json.load(f)
-        return payload if isinstance(payload, dict) else {}
-    except Exception as e:
-        log_background_error("读取定时任务预设失败", e)
-        return {}
+    return read_json_file(path, default={}, expected_type=dict, log_context="读取定时任务预设失败")
 
 def save_scheduled_task_presets(presets, config_dir=None):
     path = scheduled_preset_path(config_dir)
@@ -1122,6 +1128,7 @@ def delete_path(path, perm, log_fn):
                 log_fn(f"[回收站失败] {path} 仍存在")
             else:
                 log_fn(f"[回收站失败] {path}")
+            return False
             
         if os.path.isfile(path) or os.path.islink(path):
             try:
@@ -1134,21 +1141,32 @@ def delete_path(path, perm, log_fn):
                     return True
                 raise e
         else:
+            delayed_paths = []
+            failed_paths = []
             def _onerror(func, p, exc_info):
                 # 遍历删文件夹遇到顽固驱动文件时触发
                 if ctypes.windll.kernel32.MoveFileExW(p, None, 4):
                     log_fn(f"[延期粉碎] 锁定项已安排重启销毁: {os.path.basename(p)}")
+                    delayed_paths.append(p)
                 else:
-                    pass # 忽略错误，继续删其他能删的
+                    failed_paths.append(p)
                     
             shutil.rmtree(path, onerror=_onerror)
             
             # 如果文件夹还没被彻底删掉(里面有延期删除的文件)，把文件夹自己也标记上
             if os.path.lexists(path):
-                ctypes.windll.kernel32.MoveFileExW(path, None, 4)
+                if ctypes.windll.kernel32.MoveFileExW(path, None, 4):
+                    delayed_paths.append(path)
+                else:
+                    failed_paths.append(path)
                 
         if not os.path.lexists(path):
             log_fn(f"[永久删除] 成功移除: {path}")
+        elif 'failed_paths' in locals() and failed_paths:
+            preview = failed_paths[:3]
+            suffix = f" 等 {len(failed_paths)} 项" if len(failed_paths) > 3 else ""
+            log_fn(f"[失败] 无法删除或安排重启删除: {', '.join(preview)}{suffix}")
+            return False
         else:
             log_fn(f"[部分挂起] 包含内核驱动保护，请重启电脑完成彻底清理: {path}")
         return True
@@ -1524,7 +1542,11 @@ def infer_install_location(name="", publisher="", install_location="", uninstall
             pass
     return direct
 
-def build_uninstall_command(command_text, prefer_silent=False):
+def build_uninstall_command(command_text, prefer_silent=False, quiet_command=""):
+    quiet_raw = str(quiet_command or "").strip()
+    if prefer_silent and quiet_raw:
+        return quiet_raw, "静默(注册表)"
+
     raw = str(command_text or "").strip()
     if not raw:
         return "", "无命令"
@@ -1535,7 +1557,7 @@ def build_uninstall_command(command_text, prefer_silent=False):
     exe_name = os.path.basename(_extract_command_executable(raw)).lower()
 
     if "msiexec" in lower:
-        cmd = re.sub(r"(?i)\s/i(?=\s)", " /x", raw, count=1)
+        cmd = re.sub(r"(?i)(^|\s)/(i|package)(?=\s|\{)", r"\1/x", raw, count=1)
         if not re.search(r"(?i)(/q[nrb]?|/quiet)", cmd):
             cmd += " /qn /norestart"
         return cmd, "静默(MSI)"
@@ -1569,6 +1591,45 @@ def build_uninstall_command(command_text, prefer_silent=False):
         return cmd, "静默(Burn/WiX)"
 
     return raw, "标准"
+
+def run_uninstall_command(app_name, command_text, quiet_command="", prefer_silent=False, timeout_sec=1200, log_fn=None, prefix="[标准卸载]"):
+    name = str(app_name or "").strip() or "未知软件"
+    cmd, mode_text = build_uninstall_command(command_text, prefer_silent=prefer_silent, quiet_command=quiet_command)
+    if not cmd:
+        if log_fn:
+            log_fn(f"{prefix} 跳过 {name}：未提供卸载命令")
+        return "skipped", "未提供卸载命令"
+
+    if log_fn:
+        log_fn(f"{prefix} 正在调用{mode_text}卸载: {name}")
+    try:
+        proc = subprocess.Popen(
+            ["cmd", "/c", cmd],
+            creationflags=subprocess.CREATE_NO_WINDOW
+        )
+        try:
+            proc.wait(timeout=max(30, int(timeout_sec)))
+        except subprocess.TimeoutExpired:
+            terminate_process_tree(proc.pid)
+            msg = f"超时已终止（超过 {max(30, int(timeout_sec)) // 60} 分钟）"
+            if log_fn:
+                log_fn(f"{prefix} {msg}: {name}")
+            return "failed", msg
+
+        success_codes = {0, 3010, 1641}
+        if proc.returncode not in success_codes:
+            msg = f"返回码异常: {proc.returncode}"
+            if log_fn:
+                log_fn(f"{prefix} {msg}: {name}")
+            return "failed", msg
+        if proc.returncode in {3010, 1641} and log_fn:
+            log_fn(f"{prefix} {name} 已完成，系统可能需要重启以完成收尾")
+        return "ok", mode_text
+    except Exception as e:
+        msg = format_exception_text(e)
+        if log_fn:
+            log_fn(f"{prefix} 启动失败: {name} -> {msg}")
+        return "failed", msg
 
 def terminate_process_tree(pid):
     try:
@@ -1776,6 +1837,7 @@ def scan_installed_software_entries(stop_event=None):
                                 ver = get_val("DisplayVersion")
                                 pub = get_val("Publisher")
                                 cmd = get_val("UninstallString")
+                                quiet_cmd = get_val("QuietUninstallString")
                                 loc = get_val("InstallLocation")
                                 d_icon = get_val("DisplayIcon")
                                 icon_path = d_icon.split(',')[0].strip(' "') if d_icon else ""
@@ -1787,6 +1849,7 @@ def scan_installed_software_entries(stop_event=None):
                                     "version": ver,
                                     "publisher": pub,
                                     "cmd": cmd,
+                                    "quiet_cmd": quiet_cmd,
                                     "location": inferred_loc or loc,
                                     "reg": reg,
                                     "icon_path": icon_path,
@@ -1832,26 +1895,18 @@ def _normalize_drive_letter(drive_letter="C"):
     return (drive[:1] or "C").upper()
 
 def _load_scan_cache():
-    try:
-        if not os.path.exists(CACHE_FILE):
-            return {}
-        with open(CACHE_FILE, "r", encoding="utf-8") as f:
-            raw = json.load(f)
-        if not isinstance(raw, dict):
-            return {}
-        drives = raw.get("drives")
-        if isinstance(drives, dict):
-            return drives
-        if "threads" in raw and "dtype" in raw:
-            return {
-                "C": {
-                    "threads": raw.get("threads", 4),
-                    "dtype": raw.get("dtype", "Unknown"),
-                    "ts": raw.get("ts", 0)
-                }
+    raw = read_json_file(CACHE_FILE, default={}, expected_type=dict, log_context="读取扫描缓存")
+    drives = raw.get("drives") if isinstance(raw, dict) else None
+    if isinstance(drives, dict):
+        return drives
+    if isinstance(raw, dict) and "threads" in raw and "dtype" in raw:
+        return {
+            "C": {
+                "threads": raw.get("threads", 4),
+                "dtype": raw.get("dtype", "Unknown"),
+                "ts": raw.get("ts", 0)
             }
-    except Exception as e:
-        log_background_error("读取扫描缓存", e)
+        }
     return {}
 
 def _save_scan_cache(drives):
@@ -2317,6 +2372,20 @@ def scan_big_files(roots, min_b, excl, stop, workers=4, result_limit=None, progr
 
 def _walk_files_headless(roots, excl, workers, stop_event=None, ext_filter=None, collect_files=False, collect_dirs=False):
     """Standalone multi-threaded file/dir walker for headless (non-UI) scheduled jobs."""
+    return walk_files_threaded(
+        roots,
+        excl,
+        workers,
+        stop_event=stop_event,
+        ext_filter=ext_filter,
+        collect_files=collect_files,
+        collect_dirs=collect_dirs,
+        file_result_mode="path",
+        log_context="定时任务",
+    )
+
+def walk_files_threaded(roots, excl, workers, stop_event=None, ext_filter=None, collect_files=False, collect_dirs=False,
+                        file_cb=None, dir_cb=None, file_result_mode="size_path", log_context="遍历目录"):
     dir_queue = queue.Queue()
     res_files = []
     res_dirs = []
@@ -2333,18 +2402,18 @@ def _walk_files_headless(roots, excl, workers, stop_event=None, ext_filter=None,
             if d is _SENTINEL:
                 dir_queue.task_done()
                 break
-            if stop_event and stop_event.is_set():
+            if stop_event is not None and stop_event.is_set():
                 dir_queue.task_done()
                 continue
             try:
                 entries = os.scandir(d)
             except Exception as e:
-                log_sampled_background_error("定时任务遍历目录", e)
+                log_sampled_background_error(f"{log_context}遍历目录", e)
                 dir_queue.task_done()
                 continue
             try:
                 for entry in entries:
-                    if stop_event and stop_event.is_set():
+                    if stop_event is not None and stop_event.is_set():
                         break
                     try:
                         if entry.is_symlink():
@@ -2355,19 +2424,27 @@ def _walk_files_headless(roots, excl, workers, stop_event=None, ext_filter=None,
                                 if collect_dirs:
                                     with lock:
                                         res_dirs.append(entry.path)
+                                if dir_cb:
+                                    dir_cb(entry.path)
                         elif entry.is_file(follow_symlinks=False):
                             if ext_filter and not entry.name.lower().endswith(ext_filter):
                                 continue
+                            size = entry.stat(follow_symlinks=False).st_size
                             if collect_files:
                                 with lock:
-                                    res_files.append(entry.path)
+                                    if file_result_mode == "path":
+                                        res_files.append(entry.path)
+                                    else:
+                                        res_files.append((size, entry.path))
+                            if file_cb:
+                                file_cb(size, entry.path)
                     except Exception as e:
-                        log_sampled_background_error("定时任务扫描条目", e)
+                        log_sampled_background_error(f"{log_context}扫描条目", e)
             finally:
                 try:
                     entries.close()
                 except Exception as e:
-                    log_sampled_background_error("定时任务关闭扫描句柄", e, limit=3)
+                    log_sampled_background_error(f"{log_context}关闭扫描句柄", e, limit=3)
             dir_queue.task_done()
 
     threads = []
@@ -2380,7 +2457,7 @@ def _walk_files_headless(roots, excl, workers, stop_event=None, ext_filter=None,
     sent_stop = False
     try:
         while not join_done.wait(0.1):
-            if stop_event and stop_event.is_set() and not sent_stop:
+            if stop_event is not None and stop_event.is_set() and not sent_stop:
                 for _ in threads:
                     dir_queue.put(_SENTINEL)
                 sent_stop = True
@@ -3684,7 +3761,25 @@ class DriveSelector(QWidget):
         self.btn.setToolTip(f"已选磁盘: {', '.join(sel)}" if sel else "未选择磁盘")
 
 
-class BigFileTableModel(QAbstractTableModel):
+class CheckableDictTableModel(QAbstractTableModel):
+    def _coerce_check_state(self, value):
+        if isinstance(value, Qt.CheckState):
+            return value == Qt.CheckState.Checked
+        try:
+            return int(value) == int(Qt.CheckState.Checked)
+        except Exception:
+            return bool(value)
+
+    def _set_checked_for_index(self, index, value):
+        if not index.isValid() or index.column() != 0:
+            return False
+        row = self._rows[index.row()]
+        row["checked"] = self._coerce_check_state(value)
+        self.dataChanged.emit(index, index, [Qt.ItemDataRole.CheckStateRole])
+        return True
+
+
+class BigFileTableModel(CheckableDictTableModel):
     headers = [" ", "文件名", "大小", "路径"]
 
     def __init__(self, parent=None):
@@ -3746,18 +3841,8 @@ class BigFileTableModel(QAbstractTableModel):
     def setData(self, index, value, role=Qt.ItemDataRole.EditRole):
         if not index.isValid():
             return False
-        row = self._rows[index.row()]
         if role == Qt.ItemDataRole.CheckStateRole and index.column() == 0:
-            if isinstance(value, Qt.CheckState):
-                checked = value == Qt.CheckState.Checked
-            else:
-                try:
-                    checked = int(value) == int(Qt.CheckState.Checked)
-                except Exception:
-                    checked = bool(value)
-            row["checked"] = checked
-            self.dataChanged.emit(index, index, [Qt.ItemDataRole.CheckStateRole])
-            return True
+            return self._set_checked_for_index(index, value)
         return False
 
     def flags(self, index):
@@ -3826,7 +3911,7 @@ class BigFileTableModel(QAbstractTableModel):
         return ""
 
 
-class MoreCleanTableModel(QAbstractTableModel):
+class MoreCleanTableModel(CheckableDictTableModel):
     headers = [" ", "类型", "名称", "详细/大小", "路径(注册表键)"]
 
     def __init__(self, parent=None):
@@ -3897,18 +3982,8 @@ class MoreCleanTableModel(QAbstractTableModel):
     def setData(self, index, value, role=Qt.ItemDataRole.EditRole):
         if not index.isValid():
             return False
-        row = self._rows[index.row()]
         if role == Qt.ItemDataRole.CheckStateRole and index.column() == 0:
-            if isinstance(value, Qt.CheckState):
-                checked = value == Qt.CheckState.Checked
-            else:
-                try:
-                    checked = int(value) == int(Qt.CheckState.Checked)
-                except Exception:
-                    checked = bool(value)
-            row["checked"] = checked
-            self.dataChanged.emit(index, index, [Qt.ItemDataRole.CheckStateRole])
-            return True
+            return self._set_checked_for_index(index, value)
         return False
 
     def flags(self, index):
@@ -3962,7 +4037,7 @@ class MoreCleanTableModel(QAbstractTableModel):
         return None
 
 
-class UninstallTableModel(QAbstractTableModel):
+class UninstallTableModel(CheckableDictTableModel):
     headers = [" ", "分类", "名称", "版本", "发布者", "安装目录", "隐藏卸载命令"]
 
     def __init__(self, parent=None):
@@ -4059,18 +4134,8 @@ class UninstallTableModel(QAbstractTableModel):
     def setData(self, index, value, role=Qt.ItemDataRole.EditRole):
         if not index.isValid():
             return False
-        row = self._rows[index.row()]
         if role == Qt.ItemDataRole.CheckStateRole and index.column() == 0:
-            if isinstance(value, Qt.CheckState):
-                checked = value == Qt.CheckState.Checked
-            else:
-                try:
-                    checked = int(value) == int(Qt.CheckState.Checked)
-                except Exception:
-                    checked = bool(value)
-            row["checked"] = checked
-            self.dataChanged.emit(index, index, [Qt.ItemDataRole.CheckStateRole])
-            return True
+            return self._set_checked_for_index(index, value)
         return False
 
     def flags(self, index):
@@ -4576,16 +4641,7 @@ def load_language_pack(lang, config_dir=None, prefer_cloud=True, timeout=6, mani
 
 def load_runtime_global_settings(config_dir=None):
     paths = get_runtime_config_paths(config_dir)
-    path = paths["global"]
-    try:
-        if not os.path.exists(path):
-            return {}
-        with open(path, "r", encoding="utf-8") as f:
-            payload = json.load(f)
-        return payload if isinstance(payload, dict) else {}
-    except Exception as e:
-        log_background_error("读取运行时全局设置失败", e)
-        return {}
+    return read_json_file(paths["global"], default={}, expected_type=dict, log_context="读取运行时全局设置失败")
 
 def load_runtime_targets_and_settings():
     paths = get_runtime_config_paths()
@@ -4596,14 +4652,9 @@ def load_runtime_targets_and_settings():
         "protect_builtin_rules": True,
         "deleted_builtin_rules": []
     }
-    if os.path.exists(paths["global"]):
-        try:
-            with open(paths["global"], "r", encoding="utf-8") as f:
-                payload = json.load(f)
-            if isinstance(payload, dict):
-                global_settings.update(payload)
-        except Exception as e:
-            log_background_error("读取运行时全局设置失败", e)
+    payload = read_json_file(paths["global"], default={}, expected_type=dict, log_context="读取运行时全局设置失败")
+    if isinstance(payload, dict):
+        global_settings.update(payload)
 
     targets = [parse_rule_entry(t) for t in default_clean_targets()]
     targets = [t for t in targets if t]
@@ -4611,24 +4662,15 @@ def load_runtime_targets_and_settings():
     if deleted_builtin_rule_keys:
         targets = [t for t in targets if make_rule_key(t[0], t[1], t[2], t[6]) not in deleted_builtin_rule_keys]
 
-    if os.path.exists(paths["custom"]):
-        try:
-            with open(paths["custom"], "r", encoding="utf-8") as f:
-                customs = json.load(f)
-            for item in customs:
-                parsed = parse_rule_entry(item, force_custom=True)
-                if parsed:
-                    targets.append(parsed)
-        except Exception as e:
-            log_background_error("读取运行时自定义规则失败", e)
+    customs = read_json_file(paths["custom"], default=[], expected_type=list, log_context="读取运行时自定义规则失败")
+    for item in customs:
+        parsed = parse_rule_entry(item, force_custom=True)
+        if parsed:
+            targets.append(parsed)
 
-    if os.path.exists(paths["config"]):
-        try:
-            with open(paths["config"], "r", encoding="utf-8") as f:
-                saved_state = json.load(f)
-            targets = apply_saved_rule_state(targets, saved_state)
-        except Exception as e:
-            log_background_error("读取运行时勾选状态失败", e)
+    saved_state = read_json_file(paths["config"], default=None, log_context="读取运行时勾选状态失败")
+    if saved_state is not None:
+        targets = apply_saved_rule_state(targets, saved_state)
 
     return paths["config_dir"], global_settings, targets
 
@@ -4849,42 +4891,29 @@ def _run_scheduled_standard_uninstall(config_dir, task_name, log):
             log(f"[应用标准卸载] 跳过 {current['name']}：属于高风险/系统组件，不支持定时自动卸载")
             continue
         cmd = current.get("cmd", "")
-        if not cmd:
+        quiet_cmd = current.get("quiet_cmd", "")
+        if not cmd and not quiet_cmd:
             sk += 1
             log(f"[应用标准卸载] 跳过 {current['name']}：未提供卸载命令")
             continue
 
-        run_cmd, mode_text = build_uninstall_command(cmd, prefer_silent=prefer_silent)
-        log(f"[应用标准卸载] 正在调用{mode_text}卸载: {current['name']}")
-        try:
-            proc = subprocess.Popen(
-                ["cmd", "/c", run_cmd],
-                creationflags=subprocess.CREATE_NO_WINDOW
-            )
-            try:
-                proc.wait(timeout=timeout_sec)
-            except subprocess.TimeoutExpired:
-                terminate_process_tree(proc.pid)
-                fl += 1
-                log(f"[应用标准卸载] 超时已终止: {current['name']}（超过 {timeout_sec // 60} 分钟）")
-                continue
-
-            if proc.returncode != 0:
-                fl += 1
-                log(f"[应用标准卸载] 返回码异常: {current['name']} -> {proc.returncode}")
-                continue
-
-            verify_ok, verify_msgs = evaluate_uninstall_result(current["name"], current.get("location", ""), current.get("reg", ""))
-            for msg in verify_msgs:
+        state, _ = run_uninstall_command(
+            current["name"],
+            cmd,
+            quiet_command=quiet_cmd,
+            prefer_silent=prefer_silent,
+            timeout_sec=timeout_sec,
+            log_fn=log,
+            prefix="[应用标准卸载]"
+        )
+        if state == "ok":
+            ok += 1
+            for msg in evaluate_uninstall_result(current["name"], current.get("location", ""), current.get("reg", ""))[1]:
                 log(msg)
-            if verify_ok:
-                ok += 1
-            else:
-                fl += 1
-                log(f"[应用标准卸载] 校验未通过: {current['name']}")
-        except Exception as e:
+        elif state == "skipped":
+            sk += 1
+        else:
             fl += 1
-            log(f"[应用标准卸载] 启动失败: {current['name']} -> {format_exception_text(e)}")
 
     log(f"[应用标准卸载] 完成：成功 {ok}，失败 {fl}，跳过 {sk}")
 
@@ -5918,7 +5947,8 @@ class ScheduledUninstallDialog(MessageBoxBase):
                         "publisher": data.get("publisher", ""),
                         "reg": data.get("reg", ""),
                         "location": data.get("location", ""),
-                    "cmd": data.get("cmd", "")
+                        "cmd": data.get("cmd", ""),
+                        "quiet_cmd": data.get("quiet_cmd", "")
                     })
         return rows
 
@@ -8843,7 +8873,43 @@ class CleanPage(ScrollArea):
         a3.setEnabled(ex)
         m.addAction(a3)
         gp = self.tbl.viewport().mapToGlobal(pos)
-        QTimer.singleShot(0, lambda: m.exec(gp, ani=False, aniType=MenuAnimationType.NONE))
+    QTimer.singleShot(0, lambda: m.exec(gp, ani=False, aniType=MenuAnimationType.NONE))
+
+
+def build_uninstall_leftover_keywords(app_name="", publisher="", install_dir=""):
+    stop_words = {
+        "the", "and", "for", "with", "setup", "update", "installer", "uninstall",
+        "inc", "inc.", "ltd", "ltd.", "llc", "co", "co.", "corp", "corp.",
+        "corporation", "company", "software", "technology", "technologies",
+        "microsoft", "windows"
+    }
+    raw_values = [app_name, publisher, os.path.basename(norm_path(install_dir))]
+    candidates = []
+
+    def _add(text):
+        value = str(text or "").strip().strip(".-_ ")
+        if len(value) < 3:
+            return
+        lower = value.lower()
+        if lower in stop_words:
+            return
+        if lower not in candidates:
+            candidates.append(lower)
+
+    for raw in raw_values:
+        text = str(raw or "").strip()
+        if not text:
+            continue
+        cleaned = re.sub(r"(?i)\b(inc\.?|ltd\.?|llc|corp\.?|corporation|company|software|technologies|technology)\b", " ", text)
+        cleaned = re.sub(r"\s+", " ", cleaned).strip()
+        _add(cleaned)
+        parts = [p for p in re.split(r"[^A-Za-z0-9\u4e00-\u9fff]+", cleaned) if p]
+        for part in parts:
+            _add(part)
+        if len(parts) >= 2:
+            _add(" ".join(parts[:2]))
+
+    return candidates
 
 
 class LeftoversDialog(MessageBoxBase):
@@ -8942,7 +9008,7 @@ class LeftoversDialog(MessageBoxBase):
         local_app_data = os.environ.get("LOCALAPPDATA", "")
         prog_data = os.environ.get("PROGRAMDATA", "")
         
-        keywords = [k for k in [self.publisher, self.app_name.split()[0]] if k and len(k) > 2]
+        keywords = build_uninstall_leftover_keywords(self.app_name, self.publisher, self.install_dir)
         for base in [app_data, local_app_data, prog_data]:
             if not base: continue
             for kw in keywords:
@@ -9329,6 +9395,7 @@ class UninstallPage(DeferredPageMixin, ScrollArea):
             pub = row.get("publisher", "")
             loc = row.get("location", "")
             cmd = row.get("cmd", "")
+            quiet_cmd = row.get("quiet_cmd", "")
             reg = row.get("reg", "")
             meta = {
                 "category": row.get("category", "用户"),
@@ -9342,6 +9409,7 @@ class UninstallPage(DeferredPageMixin, ScrollArea):
                 "publisher": pub,
                 "location": loc,
                 "cmd": cmd,
+                "quiet_cmd": quiet_cmd,
                 "reg": reg,
                 "category": meta.get("category", "用户"),
                 "is_risky": bool(meta.get("is_risky", False)),
@@ -9422,48 +9490,42 @@ class UninstallPage(DeferredPageMixin, ScrollArea):
         ok = fl = sk = 0
         tot = len(data)
         for i, item in enumerate(data, 1):
-            r = item["row"]; nm = item["name"]; pub = item["publisher"]; loc = item["location"]; cmd = item["cmd"]; reg = item["reg"]
+            r = item["row"]; nm = item["name"]; pub = item["publisher"]; loc = item["location"]; cmd = item["cmd"]; quiet_cmd = item.get("quiet_cmd", ""); reg = item["reg"]
             if self.stop.is_set():
                 self.sig.uninst_done.emit(f"标准卸载已取消：成功 {ok}，失败 {fl}，跳过 {sk}，耗时 {time.time()-t0:.1f} 秒")
                 return
 
-            if not cmd:
+            if not cmd and not quiet_cmd:
                 self.sig.uninst_log.emit(f"[标准卸载] 跳过 {nm}：未提供卸载命令，请改用强力卸载")
                 sk += 1
                 self.sig.uninst_prog.emit(i, tot)
                 continue
 
-            run_cmd, mode_text = build_uninstall_command(cmd, prefer_silent=prefer_silent)
-            self.sig.uninst_log.emit(f"[标准卸载] 正在调用{mode_text}卸载: {nm}")
+            state, _ = run_uninstall_command(
+                nm,
+                cmd,
+                quiet_command=quiet_cmd,
+                prefer_silent=prefer_silent,
+                timeout_sec=timeout_sec,
+                log_fn=self.sig.uninst_log.emit,
+                prefix="[标准卸载]"
+            )
             try:
-                # 使用 cmd /c 显式调用，避免 shell=True 的隐式解析风险
-                proc = subprocess.Popen(
-                    ["cmd", "/c", run_cmd],
-                    creationflags=subprocess.CREATE_NO_WINDOW
-                )
-                try:
-                    proc.wait(timeout=max(30, int(timeout_sec)))
-                except subprocess.TimeoutExpired:
-                    terminate_process_tree(proc.pid)
+                if state == "skipped":
+                    sk += 1
+                    self.sig.uninst_prog.emit(i, tot)
+                    continue
+                if state != "ok":
                     fl += 1
-                    self.sig.uninst_log.emit(f"[标准卸载] 超时已终止: {nm}（超过 {max(30, int(timeout_sec)) // 60} 分钟）")
                     self.sig.uninst_prog.emit(i, tot)
                     continue
 
-                if proc.returncode != 0:
-                    fl += 1
-                    self.sig.uninst_log.emit(f"[标准卸载] 返回码异常: {nm} -> {proc.returncode}")
-                    self.sig.uninst_prog.emit(i, tot)
-                    continue
-
+                ok += 1
                 verify_ok, verify_msgs = evaluate_uninstall_result(nm, loc, reg)
                 for msg in verify_msgs:
                     self.sig.uninst_log.emit(msg)
-                if verify_ok:
-                    ok += 1
-                else:
-                    fl += 1
-                    self.sig.uninst_log.emit(f"[标准卸载] 校验未通过: {nm}")
+                if not verify_ok:
+                    self.sig.uninst_log.emit(f"[标准卸载] {nm} 仍检测到残留，可继续深度扫描清理")
 
                 # 串行等待用户处理"是否扫描残留"的弹窗，避免多选时上下文错位
                 self._current_uninstalling = (r, nm, pub, loc, reg)
@@ -9525,16 +9587,52 @@ class UninstallPage(DeferredPageMixin, ScrollArea):
             self.sig.uninst_log.emit("已取消高风险强力卸载操作")
             return
 
+        self.stop.clear()
+        threading.Thread(
+            target=self._force_uninstall_flow_w,
+            args=(data, self.chk_silent.isChecked(), self.sp_timeout.value() * 60),
+            daemon=True
+        ).start()
+
+    def _force_uninstall_flow_w(self, data, prefer_silent=False, timeout_sec=1200):
+        t0 = time.time()
         all_files, all_regs = [], []
         all_services, all_tasks = [], []
         chosen_apps = 0
+        uninstall_ok = uninstall_failed = uninstall_skipped = 0
         for item in data:
-            r = item["row"]; nm = item["name"]; pub = item["publisher"]; loc = item["location"]; reg = item["reg"]
-            picked = self._pick_leftovers(nm, pub, loc, reg)
+            if self.stop.is_set():
+                self.sig.uninst_done.emit(f"强力卸载已取消：已处理 {chosen_apps} 个软件，耗时 {time.time()-t0:.1f} 秒")
+                return
+            nm = item["name"]; pub = item["publisher"]; loc = item["location"]; reg = item["reg"]
+            cmd = item.get("cmd", ""); quiet_cmd = item.get("quiet_cmd", "")
+
+            if cmd or quiet_cmd:
+                self.sig.uninst_log.emit(f"[强力卸载] 先调用卸载器: {nm}")
+                state, _ = run_uninstall_command(
+                    nm,
+                    cmd,
+                    quiet_command=quiet_cmd,
+                    prefer_silent=prefer_silent,
+                    timeout_sec=timeout_sec,
+                    log_fn=self.sig.uninst_log.emit,
+                    prefix="[强力卸载]"
+                )
+                if state == "ok":
+                    uninstall_ok += 1
+                    for msg in evaluate_uninstall_result(nm, loc, reg)[1]:
+                        self.sig.uninst_log.emit(msg)
+                elif state == "skipped":
+                    uninstall_skipped += 1
+                else:
+                    uninstall_failed += 1
+                    self.sig.uninst_log.emit(f"[强力卸载] 卸载器未成功完成，将继续尝试扫描并清理残留: {nm}")
+            else:
+                uninstall_skipped += 1
+                self.sig.uninst_log.emit(f"[强力卸载] {nm} 未提供卸载命令，将直接扫描残留")
+
+            picked = self._request_leftover_pick(nm, pub, loc, reg)
             if picked is None:
-                continue
-            if not self._confirm_leftover_protection_summary(nm, picked):
-                self.sig.uninst_log.emit(f"[分级保护] 已取消 {nm} 的高风险残留强力清理")
                 continue
             del_files = picked["files"]; del_regs = picked["regs"]
             del_services = picked["services"]; del_tasks = picked["tasks"]
@@ -9547,7 +9645,9 @@ class UninstallPage(DeferredPageMixin, ScrollArea):
             all_tasks.extend(del_tasks)
 
         if chosen_apps == 0:
-            self.sig.uninst_log.emit("未选择任何残留项，操作已取消")
+            self.sig.uninst_done.emit(
+                f"强力卸载流程结束：卸载器成功 {uninstall_ok}，失败 {uninstall_failed}，跳过 {uninstall_skipped}；未选择任何残留项，耗时 {time.time()-t0:.1f} 秒"
+            )
             return
 
         # 去重并保持顺序，避免重复删除同一路径/注册表键
@@ -9556,10 +9656,47 @@ class UninstallPage(DeferredPageMixin, ScrollArea):
         all_services = list({service["name"].lower(): service for service in all_services}.values())
         all_tasks = list({task["full_name"].lower(): task for task in all_tasks}.values())
         self.sig.uninst_log.emit(
-            f"[强力清除] 批量任务已确认：软件 {chosen_apps} 个，文件/目录 {len(all_files)} 项，注册表 {len(all_regs)} 项，服务 {len(all_services)} 项，计划任务 {len(all_tasks)} 项"
+            f"[强力清除] 批量任务已确认：软件 {chosen_apps} 个，卸载器成功 {uninstall_ok}，失败 {uninstall_failed}，跳过 {uninstall_skipped}；文件/目录 {len(all_files)} 项，注册表 {len(all_regs)} 项，服务 {len(all_services)} 项，计划任务 {len(all_tasks)} 项"
         )
-        self.stop.clear()
-        threading.Thread(target=self._force_uninst_w, args=(all_files, all_regs, all_services, all_tasks), daemon=True).start()
+        self._force_uninst_w(all_files, all_regs, all_services, all_tasks)
+
+    def _request_leftover_pick(self, nm, pub, loc, reg):
+        return self._invoke_ui_request(
+            "_prompt_leftover_pick",
+            "_leftover_pick_payload",
+            (nm, pub, loc, reg),
+            "_leftover_pick_result",
+            "_leftover_pick_done",
+            LEFTOVER_PROMPT_TIMEOUT_SEC,
+            f"[强力卸载] 等待残留选择超时，已跳过: {nm}",
+        )
+
+    def _invoke_ui_request(self, slot_name, payload_attr, payload, result_attr, done_attr, timeout_sec, timeout_message):
+        setattr(self, payload_attr, payload)
+        setattr(self, result_attr, None)
+        done = threading.Event()
+        setattr(self, done_attr, done)
+        invoked = QMetaObject.invokeMethod(self, slot_name, Qt.ConnectionType.QueuedConnection)
+        if not invoked:
+            self.sig.uninst_log.emit(f"[UI] 无法调起请求: {slot_name}")
+            return None
+        if not done.wait(timeout=timeout_sec):
+            self.sig.uninst_log.emit(timeout_message)
+            return None
+        return getattr(self, result_attr, None)
+
+    @Slot()
+    def _prompt_leftover_pick(self):
+        try:
+            nm, pub, loc, reg = self._leftover_pick_payload
+            picked = self._pick_leftovers(nm, pub, loc, reg)
+            if picked is not None and not self._confirm_leftover_protection_summary(nm, picked):
+                self.sig.uninst_log.emit(f"[分级保护] 已取消 {nm} 的高风险残留强力清理")
+                picked = None
+            self._leftover_pick_result = picked
+        finally:
+            if hasattr(self, "_leftover_pick_done"):
+                self._leftover_pick_done.set()
 
     def _pick_leftovers(self, nm, pub, loc, reg):
         dialog = LeftoversDialog(self.window(), nm, pub, loc, reg)
@@ -10208,86 +10345,19 @@ class MoreCleanPage(DeferredPageMixin, ScrollArea):
         elif idx == 4: threading.Thread(target=self._scan_context_menu, daemon=True).start()
 
     def _walk_files_threaded(self, roots, excl, workers, file_cb=None, dir_cb=None, ext_filter=None, collect_files=False, collect_dirs=False):
-        dir_queue = queue.Queue()
-        res_files = []
-        res_dirs = []
-        lock = threading.Lock()
-        for r in roots:
-            dir_queue.put(r)
-
-        def _worker():
-            while True:
-                try:
-                    d = dir_queue.get(timeout=0.05)
-                except queue.Empty:
-                    continue
-                if d is _SENTINEL:
-                    dir_queue.task_done()
-                    break
-                if self.stop.is_set():
-                    dir_queue.task_done()
-                    continue
-                try:
-                    entries = os.scandir(d)
-                except Exception as e:
-                    log_sampled_background_error("遍历目录", e)
-                    dir_queue.task_done()
-                    continue
-                try:
-                    for e in entries:
-                        if self.stop.is_set():
-                            break
-                        try:
-                            if e.is_symlink():
-                                continue
-                            if e.is_dir(follow_symlinks=False):
-                                if not should_exclude(e.path, excl):
-                                    dir_queue.put(e.path)
-                                    if collect_dirs:
-                                        with lock:
-                                            res_dirs.append(e.path)
-                                    if dir_cb:
-                                        dir_cb(e.path)
-                            elif e.is_file(follow_symlinks=False):
-                                if ext_filter and not e.name.lower().endswith(ext_filter):
-                                    continue
-                                file_info = (e.stat(follow_symlinks=False).st_size, e.path)
-                                if collect_files:
-                                    with lock:
-                                        res_files.append(file_info)
-                                if file_cb:
-                                    file_cb(file_info[0], file_info[1])
-                        except Exception as e:
-                            log_sampled_background_error("扫描条目", e)
-                finally:
-                    try:
-                        entries.close()
-                    except Exception as e:
-                        log_sampled_background_error("关闭扫描句柄", e, limit=3)
-                dir_queue.task_done()
-
-        threads = []
-        for _ in range(workers):
-            t = threading.Thread(target=_worker, daemon=True)
-            t.start()
-            threads.append(t)
-        join_done = threading.Event()
-        threading.Thread(target=lambda: (dir_queue.join(), join_done.set()), daemon=True).start()
-        sent_stop_signal = False
-
-        try:
-            while not join_done.wait(0.1):
-                if self.stop.is_set() and not sent_stop_signal:
-                    for _ in threads:
-                        dir_queue.put(_SENTINEL)
-                    sent_stop_signal = True
-        finally:
-            if not sent_stop_signal:
-                for _ in threads:
-                    dir_queue.put(_SENTINEL)
-        for t in threads:
-            t.join(timeout=1)
-        return res_files, res_dirs
+        return walk_files_threaded(
+            roots,
+            excl,
+            workers,
+            stop_event=self.stop,
+            ext_filter=ext_filter,
+            collect_files=collect_files,
+            collect_dirs=collect_dirs,
+            file_cb=file_cb,
+            dir_cb=dir_cb,
+            file_result_mode="size_path",
+            log_context="更多清理",
+        )
 
     def _scan_duplicates(self, roots, workers):
         t0 = time.time()
@@ -12211,6 +12281,7 @@ class MainWindow(MSFluentWindow):
                 "publisher": item.get("publisher", ""),
                 "location": item.get("location", ""),
                 "cmd": item.get("cmd", ""),
+                "quiet_cmd": item.get("quiet_cmd", ""),
                 "reg": item.get("reg", ""),
                 "icon_path": icon_path,
                 "is_risky": is_risky,
