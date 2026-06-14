@@ -1,11 +1,12 @@
 # -*- coding: utf-8 -*-
 """
-C盘强力清理工具 v0.7.0
+C盘强力清理工具 v0.7.1
 PySide6 + PySide6-Fluent-Widgets (Fluent2 UI)
 包含：常规清理(支持拖拽排序与自定义规则)、大文件扫描、重复文件、空文件夹、无效快捷方式等
 """
 
 import os, sys, time, ctypes, threading, subprocess, queue, json, hashlib, winreg, re, heapq, tempfile, gc, shutil
+import urllib.parse
 import urllib.request
 import webbrowser
 from collections import defaultdict
@@ -126,7 +127,7 @@ InfoBar = _RuntimeInfoBar(_FluentInfoBar)
 # ══════════════════════════════════════════════════════════
 #  版本与更新配置
 # ══════════════════════════════════════════════════════════
-CURRENT_VERSION = "0.7.0"
+CURRENT_VERSION = "0.7.1"
 UPDATE_JSON_URL = "https://gitee.com/kio0/c_cleaner_plus/raw/master/update.json"
 APP_SCHEDULED_TASK_PREFIX = "C盘强力清理工具 - "
 APP_AUTOSTART_TASK_NAME = "C盘强力清理工具 开机自启"
@@ -1335,61 +1336,110 @@ def estimate_rule_size(entry, stop_flag=None):
         return 0
     return 0
 
-_PROTECTED_SYSTEM_PATHS = None
+def _normalize_safety_path(path):
+    raw = str(path or "").strip()
+    if not raw:
+        return ""
+    return os.path.normcase(
+        os.path.abspath(os.path.expandvars(raw))
+    ).rstrip("\\/")
+
+def _path_is_same_or_child(path, root):
+    if not path or not root:
+        return False
+    try:
+        return os.path.commonpath([path, root]) == root
+    except ValueError:
+        return False
 
 def _protected_system_paths():
-    """返回一组规范化后的系统关键目录（精确匹配），删除其自身将被拒绝。"""
-    global _PROTECTED_SYSTEM_PATHS
-    if _PROTECTED_SYSTEM_PATHS is not None:
-        return _PROTECTED_SYSTEM_PATHS
-    paths = set()
-
-    def _add(p):
-        try:
-            if not p:
-                return
-            norm = os.path.normcase(os.path.abspath(os.path.expandvars(str(p)))).rstrip("\\/")
-            if norm:
-                paths.add(norm)
-        except Exception:
-            pass
-
+    """Return exact roots and descendant roots guarded from generic deletion."""
     system_root = os.environ.get("SystemRoot", r"C:\Windows")
     system_drive = os.environ.get("SystemDrive", "C:")
-    _add(system_root)
-    _add(os.path.join(system_root, "System32"))
-    _add(os.path.join(system_root, "SysWOW64"))
-    _add(os.environ.get("ProgramData", r"C:\ProgramData"))
-    _add(os.path.join(system_drive + "\\", "Users"))
-    _add(os.environ.get("PUBLIC", r"C:\Users\Public"))
-    _add(os.environ.get("USERPROFILE"))
-    _add(os.environ.get("LOCALAPPDATA"))
-    _PROTECTED_SYSTEM_PATHS = paths
-    return paths
+    exact_roots = {
+        system_root,
+        os.path.join(system_root, "System32"),
+        os.path.join(system_root, "SysWOW64"),
+        os.environ.get("ProgramData", r"C:\ProgramData"),
+        os.environ.get("ProgramFiles", r"C:\Program Files"),
+        os.environ.get("ProgramFiles(x86)", r"C:\Program Files (x86)"),
+        os.path.join(system_drive + "\\", "Users"),
+        os.environ.get("PUBLIC", r"C:\Users\Public"),
+        os.environ.get("USERPROFILE"),
+        os.environ.get("LOCALAPPDATA"),
+    }
+    descendant_roots = {
+        system_root,
+        os.environ.get("ProgramData", r"C:\ProgramData"),
+        os.environ.get("ProgramFiles", r"C:\Program Files"),
+        os.environ.get("ProgramFiles(x86)", r"C:\Program Files (x86)"),
+    }
+    return (
+        {_normalize_safety_path(path) for path in exact_roots if path},
+        {_normalize_safety_path(path) for path in descendant_roots if path},
+    )
+
+def _allowed_protected_cleanup_paths():
+    """Return vetted cache containers inside otherwise protected roots."""
+    system_root = os.environ.get("SystemRoot", r"C:\Windows")
+    program_data = os.environ.get("ProgramData", r"C:\ProgramData")
+    join = os.path.join
+    directory_roots = {
+        join(system_root, "Temp"),
+        join(system_root, "Prefetch"),
+        join(system_root, "Logs", "CBS"),
+        join(system_root, "Logs", "DISM"),
+        join(system_root, "LiveKernelReports"),
+        join(system_root, "System32", "config", "systemprofile", "AppData", "Local", "Microsoft", "Windows", "WER"),
+        join(system_root, "Minidump"),
+        join(system_root, "SoftwareDistribution", "Download"),
+        join(system_root, "SoftwareDistribution", "DeliveryOptimization"),
+        join(program_data, "NVIDIA Corporation", "NV_Cache"),
+    }
+    exact_files = {
+        join(system_root, "MEMORY.DMP"),
+    }
+    return (
+        {_normalize_safety_path(path) for path in directory_roots},
+        {_normalize_safety_path(path) for path in exact_files},
+    )
+
+def _is_vetted_cleanup_target(path):
+    directory_roots, exact_files = _allowed_protected_cleanup_paths()
+    if path in exact_files:
+        return True
+    return any(path != root and _path_is_same_or_child(path, root) for root in directory_roots)
 
 def is_protected_system_path(path):
-    """判断路径是否为受保护的系统关键路径（盘根、UNC 根或系统关键目录本身）。
-
-    仅拦截这些目录“自身”，其子路径（如 C:\\Windows\\Temp 下的文件）不受影响，
-    以免误伤清理器的正常工作目标。出现异常时保守返回 True（拒绝删除）。
-    """
+    """Reject drive roots and sensitive system descendants outside vetted caches."""
     try:
         raw = str(path or "").strip()
         if not raw:
             return True
-        normalized = os.path.normcase(os.path.abspath(os.path.expandvars(raw))).rstrip("\\/")
+        normalized = _normalize_safety_path(raw)
         if not normalized:
             return True
-        # 盘根，例如 C:\
         drive, tail = os.path.splitdrive(normalized)
         if drive and tail in ("", "\\", "/"):
             return True
-        # UNC 根，例如 \\server 或 \\server\share
         if normalized.startswith("\\\\"):
             parts = [seg for seg in normalized.split("\\") if seg]
             if len(parts) <= 2:
                 return True
-        return normalized in _protected_system_paths()
+
+        exact_roots, descendant_roots = _protected_system_paths()
+        candidates = {normalized}
+        real_path = _normalize_safety_path(os.path.realpath(os.path.expandvars(raw)))
+        if real_path:
+            candidates.add(real_path)
+
+        for candidate in candidates:
+            if candidate in exact_roots:
+                return True
+            for root in descendant_roots:
+                if _path_is_same_or_child(candidate, root) and not _is_vetted_cleanup_target(candidate):
+                    return True
+        return False
     except Exception:
         return True
 
@@ -5158,7 +5208,7 @@ def _run_scheduled_shortcuts(permanent_delete, log):
     log(f"[无效快捷方式] 完成：成功 {ok}，失败 {fl}")
 
 def _run_scheduled_registry_cleanup(log):
-    log("[卸载注册表清理] 开始扫描...")
+    log("[卸载注册表检查] 开始扫描（安全模式：仅报告，不自动删除）...")
     keys_to_check = [
         (winreg.HKEY_LOCAL_MACHINE, r"SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall"),
         (winreg.HKEY_LOCAL_MACHINE, r"SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall"),
@@ -5194,17 +5244,13 @@ def _run_scheduled_registry_cleanup(log):
         emit_error_summary(log, "卸载注册表扫描异常", scan_errors, error_count)
 
     if not invalid_paths:
-        log("[卸载注册表清理] 未发现无效卸载注册表项")
+        log("[卸载注册表检查] 未发现安装目录缺失的卸载注册表项")
         return
 
-    log(f"[卸载注册表清理] 发现 {len(invalid_paths)} 个无效卸载注册表项，开始清理")
-    ok = fl = 0
+    log(f"[卸载注册表检查] 发现 {len(invalid_paths)} 个疑似项；为避免误删，定时任务不会自动删除")
     for reg_path in invalid_paths:
-        if force_delete_registry(reg_path, log) in {"deleted", "missing"}:
-            ok += 1
-        else:
-            fl += 1
-    log(f"[卸载注册表清理] 完成：成功 {ok}，失败 {fl}")
+        log(f"[卸载注册表检查] 疑似安装目录缺失: {reg_path}")
+    log(f"[卸载注册表检查] 完成：报告 {len(invalid_paths)} 项，删除 0 项")
 
 def _verify_uninstall_result_messages(app_name, install_dir, reg_path):
     verify_ok, messages = evaluate_uninstall_result(app_name, install_dir, reg_path)
@@ -5305,7 +5351,7 @@ SCHEDULED_FEATURE_LABELS = {
     "clean": "常规清理",
     "empty_dirs": "空文件夹清理",
     "shortcuts": "无效快捷方式清理",
-    "registry_cleanup": "卸载注册表清理",
+    "registry_cleanup": "卸载注册表检查（只报告）",
     "uninstall_std": "应用标准卸载",
 }
 
@@ -5528,13 +5574,38 @@ SAMPLE_RULE_PACKS = [
 ]
 RULE_STORE_INDEX_URL = "https://gitee.com/kio0/c_cleaner_plus/raw/master/config_store.json"
 RULE_PACK_DOWNLOAD_BASE = "https://gitee.com/kio0/c_cleaner_plus/raw/master/config"
+RULE_PACK_MAX_BYTES = 4 * 1024 * 1024
+
+def normalize_rule_pack_filename(filename):
+    name = str(filename or "").strip()
+    if not name or len(name) > 160:
+        return ""
+    if name != os.path.basename(name) or os.path.isabs(name) or os.path.splitdrive(name)[0]:
+        return ""
+    if "/" in name or "\\" in name or name in {".", ".."}:
+        return ""
+    if not name.lower().endswith(".json"):
+        return ""
+    if not re.fullmatch(r"[\w.-]+", name, flags=re.UNICODE):
+        return ""
+    return name
+
+def safe_rule_pack_path(filename, base_dir=None):
+    safe_name = normalize_rule_pack_filename(filename)
+    if not safe_name:
+        raise ValueError("规则包文件名不安全")
+    base = os.path.abspath(get_rule_pack_cache_dir(base_dir))
+    target = os.path.abspath(os.path.join(base, safe_name))
+    if os.path.commonpath([base, target]) != base:
+        raise ValueError("规则包路径越界")
+    return target
 
 def _normalize_rule_store_item(item):
     if not isinstance(item, dict):
         return None
 
     title = str(item.get("title", "")).strip()
-    filename = str(item.get("filename", "")).strip()
+    filename = normalize_rule_pack_filename(item.get("filename", ""))
     if not title or not filename:
         return None
 
@@ -5580,7 +5651,7 @@ def list_rule_pack_cache_records(store_items, base_dir):
     for item in store_items or []:
         if not isinstance(item, dict):
             continue
-        filename = str(item.get("filename", "")).strip()
+        filename = normalize_rule_pack_filename(item.get("filename", ""))
         if filename and filename not in item_map:
             item_map[filename] = item
 
@@ -5588,7 +5659,7 @@ def list_rule_pack_cache_records(store_items, base_dir):
     seen = set()
 
     for filename, item in item_map.items():
-        path = os.path.join(base_dir, filename)
+        path = safe_rule_pack_path(filename, base_dir)
         if os.path.isfile(path):
             seen.add(filename.lower())
             records.append({
@@ -5620,8 +5691,11 @@ def list_rule_pack_cache_records(store_items, base_dir):
     return records
 
 def get_sample_rule_pack_path(filename, base_dir=None):
+    filename = normalize_rule_pack_filename(filename)
+    if not filename:
+        raise ValueError("规则包文件名不安全")
     candidates = [
-        os.path.join(get_rule_pack_cache_dir(base_dir), filename),
+        safe_rule_pack_path(filename, base_dir),
         os.path.join(app_root_dir(), filename),
         resource_path(filename)
     ]
@@ -5636,13 +5710,24 @@ def get_sample_rule_pack_path(filename, base_dir=None):
     return candidates[0]
 
 def download_rule_pack(filename, base_dir=None):
-    local_path = os.path.join(get_rule_pack_cache_dir(base_dir), filename)
+    filename = normalize_rule_pack_filename(filename)
+    if not filename:
+        raise ValueError("规则包文件名不安全")
+    local_path = safe_rule_pack_path(filename, base_dir)
     os.makedirs(os.path.dirname(local_path), exist_ok=True)
-    url = f"{RULE_PACK_DOWNLOAD_BASE}/{filename}"
+    url = f"{RULE_PACK_DOWNLOAD_BASE}/{urllib.parse.quote(filename)}"
     with urllib.request.urlopen(url, timeout=10) as resp:
-        data = resp.read()
-    with open(local_path, "wb") as f:
-        f.write(data)
+        content_length = resp.headers.get("Content-Length") if getattr(resp, "headers", None) else None
+        if content_length and int(content_length) > RULE_PACK_MAX_BYTES:
+            raise ValueError("规则包超过大小限制")
+        data = resp.read(RULE_PACK_MAX_BYTES + 1)
+    if len(data) > RULE_PACK_MAX_BYTES:
+        raise ValueError("规则包超过大小限制")
+    raw_text = data.decode("utf-8")
+    payload = json.loads(raw_text)
+    if not isinstance(payload, (list, dict)):
+        raise ValueError("规则包 JSON 顶层格式无效")
+    write_text_file_atomic(local_path, raw_text, encoding="utf-8")
     return local_path
 
 def resolve_rule_pack(title_text, filename, parent=None, base_dir=None):
@@ -7121,6 +7206,9 @@ class ToolboxPage(ScrollArea):
         self.stop_event.clear()
         root_text = self.edit_download_dir.text().strip()
         roots = [root_text] if root_text else default_download_dirs()
+        min_size_bytes = int(self.sp_download_min_mb.value()) * 1024 * 1024
+        min_age_days = int(self.sp_download_min_days.value())
+        include_dirs = self.chk_download_dirs.isChecked()
         self.tbl_downloads.setRowCount(0)
         self.btn_select_downloads.setText("全选")
         self.btn_select_downloads.setIcon(FIF.ACCEPT)
@@ -7134,9 +7222,9 @@ class ToolboxPage(ScrollArea):
             try:
                 items, message = scan_download_candidates(
                     roots,
-                    min_size_bytes=int(self.sp_download_min_mb.value()) * 1024 * 1024,
-                    min_age_days=int(self.sp_download_min_days.value()),
-                    include_dirs=self.chk_download_dirs.isChecked(),
+                    min_size_bytes=min_size_bytes,
+                    min_age_days=min_age_days,
+                    include_dirs=include_dirs,
                     log_fn=lambda text: self.toolboxScopedLog.emit("download", text),
                     stop_event=stop,
                 )
@@ -7174,6 +7262,7 @@ class ToolboxPage(ScrollArea):
         self.stop_event.clear()
         manual_root = self.edit_space_dir.text().strip()
         roots = [manual_root] if manual_root else self.space_drive_sel.selected_drives()
+        min_size_bytes = int(self.sp_space_min_mb.value()) * 1024 * 1024
         if not roots:
             InfoBar.warning("提示", "请先选择磁盘或指定目录", parent=self.main_win)
             return
@@ -7190,7 +7279,7 @@ class ToolboxPage(ScrollArea):
             try:
                 items, message = scan_space_usage_roots(
                     roots,
-                    min_size_bytes=int(self.sp_space_min_mb.value()) * 1024 * 1024,
+                    min_size_bytes=min_size_bytes,
                     log_fn=lambda text: self.toolboxScopedLog.emit("space", text),
                     stop_event=stop,
                 )
@@ -7834,8 +7923,8 @@ class SchedulePage(DeferredPageMixin, ScrollArea):
         self.chk_feat_shortcuts = CheckBox("无效快捷方式清理")
         self.chk_feat_shortcuts.setToolTip("扫描所有磁盘并删除指向缺失目标的快捷方式")
         row_feat.addWidget(self.chk_feat_shortcuts)
-        self.chk_feat_registry = CheckBox("卸载注册表清理")
-        self.chk_feat_registry.setToolTip("自动清理安装目录已丢失的卸载注册表项")
+        self.chk_feat_registry = CheckBox("卸载注册表检查")
+        self.chk_feat_registry.setToolTip("仅报告安装目录已丢失的疑似卸载项，不会自动删除注册表")
         row_feat.addWidget(self.chk_feat_registry)
         self.chk_feat_uninstall_std = CheckBox("应用标准卸载")
         self.chk_feat_uninstall_std.setToolTip("按任务预设的应用列表执行标准卸载，系统/高危组件会自动跳过")
@@ -8976,8 +9065,9 @@ class CleanPage(ScrollArea):
                     if 0 <= src_idx < len(self.targets):
                         self.targets[src_idx] = entry
 
-    def _try_rst(self):
-        if not getattr(self, 'chk_rst', None) or not self.chk_rst.isChecked(): return
+    def _try_rst(self, enabled):
+        if not enabled:
+            return
         if not is_admin():
             self.sig.clean_log.emit("[还原点] 需管理员权限，跳过"); return
         self.sig.clean_log.emit("[还原点] 正在创建系统还原点，请稍候...")
@@ -9308,21 +9398,25 @@ class CleanPage(ScrollArea):
             if not MessageBox("确认", "当前为强力模式，删除后无法恢复继续？", self.window()).exec():
                 self._apply_sort_state()
                 return
-        start_page_worker(self, self._cln_w)
+        permanent_delete = self.chk_perm.isChecked()
+        create_restore_point = self.chk_rst.isChecked()
+        start_page_worker(
+            self,
+            self._cln_w,
+            args=(selected_rules, permanent_delete, create_restore_point),
+        )
     
-    def _cln_w(self):
+    def _cln_w(self, selected_rules, permanent_delete, create_restore_point):
         t0 = time.time()
-        import fnmatch; pm=self.chk_perm.isChecked()
-        with self._targets_lock:
-            sel=[parse_rule_entry(t) for t in self.targets if t[3]]
-        sel=[t for t in sel if t]
-        sel, skipped_duplicates = self._dedupe_rule_targets(sel)
+        import fnmatch
+        pm = bool(permanent_delete)
+        sel, skipped_duplicates = self._dedupe_rule_targets(list(selected_rules or []))
         if skipped_duplicates:
             self.sig.clean_log.emit(f"[重复目标] 已跳过 {skipped_duplicates} 条重复清理规则，避免重复删除同一目标")
         if not sel: return
         
         # 清理前创建还原点
-        self._try_rst()
+        self._try_rst(create_restore_point)
         
         ok=fl=st=0; tot=len(sel); freed_bytes=0; lf=lambda s:self.sig.clean_log.emit(s)
         def _candidate_size(path):
@@ -10082,6 +10176,7 @@ class UninstallPage(DeferredPageMixin, ScrollArea):
 
                 # 串行等待用户处理"是否扫描残留"的弹窗，避免多选时上下文错位
                 self._current_uninstalling = (r, nm, pub, loc, reg)
+                self._leftover_prompt_result = None
                 self._leftover_prompt_done = threading.Event()
                 self._leftover_prompt_done.clear()
                 invoked = QMetaObject.invokeMethod(self, "prompt_leftover_scan", Qt.ConnectionType.QueuedConnection)
@@ -10093,6 +10188,18 @@ class UninstallPage(DeferredPageMixin, ScrollArea):
                     self.sig.uninst_log.emit(f"[标准卸载] 等待残留扫描确认超时，已跳过: {nm}")
                     self._current_uninstalling = None
                     self._leftover_prompt_done.set()
+                else:
+                    picked = self._leftover_prompt_result
+                    if picked:
+                        summary = self._force_uninst_w(
+                            picked.get("files", []),
+                            picked.get("regs", []),
+                            picked.get("services", []),
+                            picked.get("tasks", []),
+                            emit_done=False,
+                        )
+                        if summary:
+                            self.sig.uninst_log.emit(summary)
             except Exception as e:
                 fl += 1
                 self.sig.uninst_log.emit(f"[标准卸载] 启动失败: {nm} -> {e}")
@@ -10112,7 +10219,7 @@ class UninstallPage(DeferredPageMixin, ScrollArea):
             return
         r, nm, pub, loc, reg = self._current_uninstalling
         if MessageBox("卸载程序已退出", f"标准卸载流程已结束是否立刻进行深度扫描，清理 '{nm}' 可能遗留的注册表和文件残留？", self.window()).exec():
-            self._trigger_leftover_scan(r, nm, pub, loc, reg)
+            self._leftover_prompt_result = self._trigger_leftover_scan(r, nm, pub, loc, reg)
         self._current_uninstalling = None
         if hasattr(self, "_leftover_prompt_done"):
             self._leftover_prompt_done.set()
@@ -10262,16 +10369,18 @@ class UninstallPage(DeferredPageMixin, ScrollArea):
     def _trigger_leftover_scan(self, r, nm, pub, loc, reg):
         picked = self._pick_leftovers(nm, pub, loc, reg)
         if picked is None:
-            return
+            return None
+        if not self._confirm_leftover_protection_summary(nm, picked):
+            self.sig.uninst_log.emit(f"[分级保护] 已取消 {nm} 的高风险残留强力清理")
+            return None
         del_files = picked["files"]; del_regs = picked["regs"]
         del_services = picked["services"]; del_tasks = picked["tasks"]
         if not del_files and not del_regs and not del_services and not del_tasks:
-            return
+            return None
         self.sig.uninst_log.emit(f"[强力清除] 开始清理 {nm} 的残留...")
-        self.stop.clear()
-        threading.Thread(target=self._force_uninst_w, args=(del_files, del_regs, del_services, del_tasks), daemon=True).start()
+        return picked
 
-    def _force_uninst_w(self, files, regs, services=None, tasks=None):
+    def _force_uninst_w(self, files, regs, services=None, tasks=None, emit_done=True):
         t0 = time.time()
         lf = lambda s: self.sig.uninst_log.emit(s)
         services = services or []
@@ -10295,26 +10404,34 @@ class UninstallPage(DeferredPageMixin, ScrollArea):
             suffix = f"，中断于{current_stage}" if cancelled else ""
             return f"{prefix}：{'；'.join(parts)}{suffix}，耗时 {time.time()-t0:.1f} 秒"
 
+        def _finish(cancelled=False):
+            summary = _build_summary(cancelled=cancelled)
+            if emit_done:
+                self.sig.uninst_done.emit(summary)
+            return summary
+
         def _check_stop():
             if self.stop.is_set():
-                self.sig.uninst_done.emit(_build_summary(cancelled=True))
-                return True
-            return False
+                return _finish(cancelled=True)
+            return ""
 
-        if _check_stop():
-            return
+        stopped_summary = _check_stop()
+        if stopped_summary:
+            return stopped_summary
 
         current_stage = "进程解除锁定"
         for install_dir in kill_targets:
-            if _check_stop():
-                return
+            stopped_summary = _check_stop()
+            if stopped_summary:
+                return stopped_summary
             kill_app_processes(install_dir, lf)
             time.sleep(0.5)
 
         current_stage = "服务删除"
         for service in services:
-            if _check_stop():
-                return
+            stopped_summary = _check_stop()
+            if stopped_summary:
+                return stopped_summary
             if delete_service_entry(service.get("name", ""), service.get("reg_path", ""), lf):
                 stats["services"]["ok"] += 1
             else:
@@ -10322,8 +10439,9 @@ class UninstallPage(DeferredPageMixin, ScrollArea):
 
         current_stage = "计划任务删除"
         for task in tasks:
-            if _check_stop():
-                return
+            stopped_summary = _check_stop()
+            if stopped_summary:
+                return stopped_summary
             if delete_scheduled_task(task.get("full_name", ""), lf):
                 stats["tasks"]["ok"] += 1
             else:
@@ -10331,8 +10449,9 @@ class UninstallPage(DeferredPageMixin, ScrollArea):
 
         current_stage = "注册表删除"
         for reg_path in regs:
-            if _check_stop():
-                return
+            stopped_summary = _check_stop()
+            if stopped_summary:
+                return stopped_summary
             if force_delete_registry(reg_path, lf) in {"deleted", "missing"}:
                 stats["regs"]["ok"] += 1
             else:
@@ -10340,8 +10459,9 @@ class UninstallPage(DeferredPageMixin, ScrollArea):
 
         current_stage = "文件删除"
         for file_path in files:
-            if _check_stop():
-                return
+            stopped_summary = _check_stop()
+            if stopped_summary:
+                return stopped_summary
             if delete_path(file_path, True, lf):
                 stats["files"]["ok"] += 1
                 self.sig.uninst_log.emit(f"[强删文件] 成功移除: {file_path}")
@@ -10349,7 +10469,7 @@ class UninstallPage(DeferredPageMixin, ScrollArea):
                 stats["files"]["fail"] += 1
                 self.sig.uninst_log.emit(f"[强删文件] 失败(可能仍有驱动级锁定): {file_path}")
 
-        self.sig.uninst_done.emit(_build_summary(cancelled=False))
+        return _finish(cancelled=False)
 
 class BigFilePage(DeferredPageMixin, ScrollArea):
     def __init__(self, sig, stop, parent=None):
@@ -10577,30 +10697,37 @@ class BigFilePage(DeferredPageMixin, ScrollArea):
 
     def do_scan(self):
         self._ensure_heavy_content(immediate=True)
-        def _prep():
-            self.btn_sel_all.setText("全选"); self.btn_sel_all.setIcon(FIF.ACCEPT)
-        start_page_worker(self, self._scan_w, before_start=_prep)
-
-    def _scan_w(self):
-        t0 = time.time()
-        mb=self.sp_mb.value(); mx=self.sp_mx.value()
+        min_mb = self.sp_mb.value()
+        result_limit = self.sp_mx.value()
         roots = self.drive_sel.selected_drives()
+        skip_optional = self.chk_skip_special.isChecked()
         if not roots:
             self.sig.big_done.emit("warning", "错误：未选择磁盘")
             return
+
+        def _prep():
+            self.btn_sel_all.setText("全选"); self.btn_sel_all.setIcon(FIF.ACCEPT)
+        start_page_worker(
+            self,
+            self._scan_w,
+            args=(min_mb, result_limit, roots, skip_optional),
+            before_start=_prep,
+        )
+
+    def _scan_w(self, min_mb, result_limit, roots, skip_optional):
+        t0 = time.time()
         w, dtype = get_scan_threads_for_drives_cached(roots)
         self.sig.disk_ready.emit(dtype, w)
-        self.sig.big_log.emit(f"扫描 (≥{mb}MB) | 线程: {w}"); self.sig.big_clr.emit()
+        self.sig.big_log.emit(f"扫描 (≥{min_mb}MB) | 线程: {w}"); self.sig.big_clr.emit()
         self.sig.big_prog.emit(0, 0)
         self.sig.big_scan_count.emit(0)
-        skip_optional = self.chk_skip_special.isChecked()
         res = scan_big_files(
             roots,
-            mb*1024*1024,
+            min_mb*1024*1024,
             DEFAULT_EXCLUDES,
             self.stop,
             workers=w,
-            result_limit=mx,
+            result_limit=result_limit,
             progress_cb=lambda scanned: self.sig.big_scan_count.emit(scanned),
             skip_optional=skip_optional
         )
@@ -10608,7 +10735,7 @@ class BigFilePage(DeferredPageMixin, ScrollArea):
             res.clear()
             self.sig.big_done.emit("warning", f"扫描已取消，耗时 {time.time()-t0:.1f} 秒")
             return
-        shown = res[:mx]
+        shown = res[:result_limit]
         shown_count = len(shown)
         batch = []
         for sz, pa in shown:
